@@ -7,7 +7,7 @@ A tool with two modes:
 
 ## Screenshot
 
-![STL Preview Screenshot](screenshot.png)
+<img src="screenshot.png" alt="STL Preview Screenshot" width="1400" />
 
 ## Project Structure
 
