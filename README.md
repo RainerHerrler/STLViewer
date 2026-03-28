@@ -8,7 +8,11 @@ Ein Tool mit zwei Modi:
 ## Projektstruktur
 
 - `stl_index_renderer.py`: Entry-Point (CLI + GUI-Start)
-- `gui_app.py`: Tkinter-Oberfläche
+- `gui_app.py`: Kompatibilitäts-Wrapper für GUI-Start
+- `gui/app.py`: schlanker GUI-Entry-Point
+- `gui/window.py`: Hauptlogik der Tkinter-Oberfläche
+- `gui/models.py`: GUI-Datenklassen
+- `gui/utils.py`: GUI-Hilfsfunktionen
 - `renderers.py`: Blender/PyVista/Matplotlib-Renderer
 - `scanner.py`: STL-Scan, Summary, Pfadlogik
 - `config_store.py`: Laden/Speichern der Konfiguration
@@ -116,3 +120,9 @@ Optionen:
 
 - Für Rendering wird pro Modellname (`Ordner + Dateiname ohne Endung`) bevorzugt `*.stl` verwendet.
 - Existiert keine STL, wird `*.blend` gerendert.
+
+## Spenden
+
+Wenn dir das Projekt hilft und du es unterstützen möchtest, sind Spenden willkommen:
+
+- Kontakt: `herrler@buschtrommel.net`
