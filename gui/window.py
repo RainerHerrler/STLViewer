@@ -39,6 +39,7 @@ from scanner import (
 )
 from gui.models import RenderProgress
 from gui.utils import format_file_size
+from gui.i18n import LANGUAGE_CHOICES, month_label, normalize_language, tr
 
 
 def launch_gui() -> int:
@@ -48,7 +49,7 @@ def launch_gui() -> int:
     class STLPreviewApp:
         def __init__(self, root: tk.Tk, source: Path):
             self.root = root
-            self.root.title("STL Preview Index Browser")
+            self.root.title(tr("de", "app.title"))
             self.root.geometry("1300x800")
             self.root.minsize(980, 640)
             self._setup_styles()
@@ -63,6 +64,7 @@ def launch_gui() -> int:
             self.image_ext = self._config_ext("image_ext", GUI_IMAGE_EXT)
             self.renderer = self._config_renderer("renderer", "blender")
             self.blender_preset = self._config_blender_preset("blender_preset", "kontrast")
+            self.language = self._config_language("language", "de")
             self.blender_path = self._resolve_optional_path(self.gui_config.get("blender_path"))
             self.bambu_studio_path = self._resolve_optional_path(self.gui_config.get("bambu_studio_path"))
             self.index_dir = self._resolve_index_dir(
@@ -93,7 +95,7 @@ def launch_gui() -> int:
             self.selected_directory = self.source
             self.selected_timeline_key: str | None = None
             self.selected_timeline_year: str | None = None
-            self.nav_mode = tk.StringVar(value="Ordnerstruktur")
+            self.nav_mode = tk.StringVar(value="tree")
             self.current_model_files: list[Path] = []
             self.table_sort_column = "name"
             self.table_sort_desc = False
@@ -108,13 +110,16 @@ def launch_gui() -> int:
             self.search_match_dirs: set[Path] = set()
             self.file_item_paths: dict[str, Path] = {}
             self.context_model_path: Path | None = None
+            self.nav_toggle_tooltip_win = None
+            self.nav_toggle_tooltip_label = None
 
             self._build_menu()
             self._build_layout()
             self._set_path_text()
-            self._set_status("Bereit.")
-            self._set_activity("Initialer Scan läuft ...")
-            self._append_log("GUI gestartet.")
+            self.root.title(self._t("app.title"))
+            self._set_status(self._t("state.ready"))
+            self._set_activity(self._t("state.initial_scan"))
+            self._append_log(self._t("log.gui_started"))
             self._set_progress_indeterminate()
             self.root.after(100, self._process_ui_queue)
             self._start_initial_scan()
@@ -142,44 +147,42 @@ def launch_gui() -> int:
             self.style.configure("StatValue.TLabel", font=("Segoe UI", 14, "bold"), background="#ffffff", foreground="#1f2d3d")
             self.style.configure("Toolbar.TButton", padding=(10, 4))
             self.style.configure("Search.TEntry", padding=(6, 4))
+            self.style.configure("SearchGroup.TFrame", background="#eef2f7", relief="solid", borderwidth=1)
 
         def _build_menu(self):
             menubar = tk.Menu(self.root)
             file_menu = tk.Menu(menubar, tearoff=0)
-            file_menu.add_command(label="Startverzeichnis ändern...", command=self.change_start_dir)
-            file_menu.add_command(label="Einstellungen...", command=self.open_config_dialog)
-            file_menu.add_command(label="Neu scannen", command=lambda: self._start_initial_scan(force=True))
-            file_menu.add_command(label="Lösche Index", command=self.delete_index_directory)
+            file_menu.add_command(label=self._t("menu.file.change_start_dir"), command=self.change_start_dir)
+            file_menu.add_command(label=self._t("menu.file.settings"), command=self.open_config_dialog)
+            file_menu.add_command(label=self._t("menu.file.rescan"), command=lambda: self._start_initial_scan(force=True))
+            file_menu.add_command(label=self._t("menu.file.delete_index"), command=self.delete_index_directory)
             file_menu.add_separator()
-            file_menu.add_command(label="Beenden", command=self.on_close)
-            menubar.add_cascade(label="Datei", menu=file_menu)
+            file_menu.add_command(label=self._t("menu.file.exit"), command=self.on_close)
+            menubar.add_cascade(label=self._t("menu.file"), menu=file_menu)
 
             render_menu = tk.Menu(menubar, tearoff=0)
             render_menu.add_command(
-                label="Starten (gesamtes Startverzeichnis)",
+                label=self._t("menu.render.start_all"),
                 command=lambda: self.start_background_render("all", overwrite=False),
             )
             render_menu.add_command(
-                label="Starten (aktuelles Verzeichnis)",
+                label=self._t("menu.render.start_current"),
                 command=lambda: self.start_background_render("current", overwrite=True),
             )
             render_menu.add_separator()
-            render_menu.add_command(label="Abbrechen", command=self.abort_background_render)
-            menubar.add_cascade(label="Rendern", menu=render_menu)
+            render_menu.add_command(label=self._t("menu.render.abort"), command=self.abort_background_render)
+            menubar.add_cascade(label=self._t("menu.render"), menu=render_menu)
 
             about_menu = tk.Menu(menubar, tearoff=0)
-            about_menu.add_command(label="Über", command=self.show_about_dialog)
-            menubar.add_cascade(label="About", menu=about_menu)
+            about_menu.add_command(label=self._t("about.menu"), command=self.show_about_dialog)
+            menubar.add_cascade(label=self._t("about.menu"), menu=about_menu)
 
             self.root.config(menu=menubar)
 
         def show_about_dialog(self):
             messagebox.showinfo(
-                "Über STL Preview",
-                "STL Preview Index Browser\n\n"
-                "Autor: Rainer Herrler\n"
-                "Kontakt: herrler@buschtrommel.net\n"
-                "Erstellt: 2026",
+                self._t("about.title"),
+                self._t("about.text"),
             )
 
         def _build_layout(self):
@@ -191,43 +194,50 @@ def launch_gui() -> int:
 
             toolbar = ttk.Frame(header, style="Top.TFrame")
             toolbar.pack(fill="x", pady=(8, 4))
-            ttk.Button(
+            self.btn_rescan = ttk.Button(
                 toolbar,
-                text="⟳ Neu scannen",
+                text=self._t("toolbar.rescan"),
                 style="Toolbar.TButton",
                 command=lambda: self._start_initial_scan(force=True),
-            ).pack(side="left")
-            ttk.Button(
+            )
+            self.btn_rescan.pack(side="left")
+            self.btn_render_current = ttk.Button(
                 toolbar,
-                text="▶ Rendern (Aktuell)",
+                text=self._t("toolbar.render_current"),
                 style="Toolbar.TButton",
                 command=lambda: self.start_background_render("current", overwrite=True),
-            ).pack(side="left", padx=(6, 0))
-            ttk.Button(
+            )
+            self.btn_render_current.pack(side="left", padx=(6, 0))
+            self.btn_render_all = ttk.Button(
                 toolbar,
-                text="▶ Rendern (Alle)",
+                text=self._t("toolbar.render_all"),
                 style="Toolbar.TButton",
                 command=lambda: self.start_background_render("all", overwrite=False),
-            ).pack(side="left", padx=(6, 0))
-            ttk.Button(toolbar, text="■ Abbrechen", style="Toolbar.TButton", command=self.abort_background_render).pack(
+            )
+            self.btn_render_all.pack(side="left", padx=(6, 0))
+            self.btn_abort = ttk.Button(toolbar, text=self._t("toolbar.abort"), style="Toolbar.TButton", command=self.abort_background_render)
+            self.btn_abort.pack(
                 side="left", padx=(6, 0)
             )
-            ttk.Button(toolbar, text="🗑 Lösche Index", style="Toolbar.TButton", command=self.delete_index_directory).pack(
+            self.btn_delete_index = ttk.Button(toolbar, text=self._t("toolbar.delete_index"), style="Toolbar.TButton", command=self.delete_index_directory)
+            self.btn_delete_index.pack(
                 side="left", padx=(6, 0)
             )
             ttk.Frame(toolbar, style="Top.TFrame").pack(side="left", fill="x", expand=True)
-            search_group = ttk.Frame(toolbar, style="Top.TFrame")
+            search_group = ttk.Frame(toolbar, style="SearchGroup.TFrame", padding=(8, 4))
             search_group.pack(side="right", padx=(20, 0))
-            ttk.Label(search_group, text="Suche:", style="Status.TLabel").pack(side="left", padx=(0, 6))
+            self.search_label = ttk.Label(search_group, text=self._t("toolbar.search"), style="Status.TLabel")
+            self.search_label.pack(side="left", padx=(0, 6))
             search_entry = ttk.Entry(search_group, textvariable=self.search_var, width=30, style="Search.TEntry")
             search_entry.pack(side="left")
             search_entry.bind("<KeyRelease>", self._on_search_keyrelease)
-            ttk.Button(
+            self.btn_clear_search = ttk.Button(
                 search_group,
-                text="✕ Leeren",
+                text=self._t("toolbar.search_clear"),
                 style="Toolbar.TButton",
                 command=self._clear_search,
-            ).pack(side="left", padx=(6, 0))
+            )
+            self.btn_clear_search.pack(side="left", padx=(6, 0))
 
             cards = ttk.Frame(header, style="Top.TFrame")
             cards.pack(fill="x", pady=(2, 6))
@@ -235,28 +245,32 @@ def launch_gui() -> int:
             def make_card(parent, title: str):
                 frame = ttk.Frame(parent, style="Card.TFrame", padding=(12, 8))
                 frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
-                ttk.Label(frame, text=title, style="StatName.TLabel").pack(anchor="w")
+                title_label = ttk.Label(frame, text=title, style="StatName.TLabel")
+                title_label.pack(anchor="w")
                 value = ttk.Label(frame, text="0", style="StatValue.TLabel")
                 value.pack(anchor="w", pady=(2, 0))
-                return value
+                return title_label, value
 
-            self.stat_stl = make_card(cards, "STL-Dateien")
-            self.stat_blend = make_card(cards, "BLEND ohne STL")
-            self.stat_total = make_card(cards, "Gesamt")
-            self.stat_existing = make_card(cards, "Bilder vorhanden")
-            self.stat_todo = make_card(cards, "Neu zu erzeugen")
+            self.stat_stl_title, self.stat_stl = make_card(cards, self._t("stats.stl"))
+            self.stat_blend_title, self.stat_blend = make_card(cards, self._t("stats.blend_only"))
+            self.stat_total_title, self.stat_total = make_card(cards, self._t("stats.total"))
+            self.stat_existing_title, self.stat_existing = make_card(cards, self._t("stats.images"))
+            self.stat_todo_title, self.stat_todo = make_card(cards, self._t("stats.todo"))
 
-            status_row = ttk.Frame(header)
-            status_row.pack(fill="x", pady=(6, 0))
-            self.status_label = ttk.Label(status_row, text="", anchor="w", style="Status.TLabel")
+            info_row = ttk.Frame(header, style="Top.TFrame")
+            info_row.pack(fill="x", pady=(6, 0))
+            left_info = ttk.Frame(info_row, style="Top.TFrame")
+            left_info.pack(side="left", fill="x", expand=True)
+            self.status_label = ttk.Label(left_info, text="", anchor="w", style="Status.TLabel")
             self.status_label.pack(fill="x")
-
-            activity_row = ttk.Frame(header)
-            activity_row.pack(fill="x", pady=(4, 0))
-            self.activity_label = ttk.Label(activity_row, text="", anchor="w")
-            self.activity_label.pack(side="left", fill="x", expand=True)
-            self.progress_bar = ttk.Progressbar(activity_row, mode="determinate", length=260)
-            self.progress_bar.pack(side="right")
+            self.activity_label = ttk.Label(left_info, text="", anchor="w", style="Status.TLabel")
+            self.activity_label.pack(fill="x", pady=(2, 0))
+            progress_wrap = ttk.Frame(info_row, style="Top.TFrame")
+            progress_wrap.pack(side="right", padx=(8, 0))
+            self.progress_title_label = ttk.Label(progress_wrap, text=self._t("progress.label"), style="Status.TLabel")
+            self.progress_title_label.pack(anchor="w")
+            self.progress_bar = ttk.Progressbar(progress_wrap, mode="determinate", length=260)
+            self.progress_bar.pack(anchor="e")
 
             separator = ttk.Separator(self.root, orient="horizontal")
             separator.pack(fill="x")
@@ -282,15 +296,19 @@ def launch_gui() -> int:
 
             nav_header = ttk.Frame(nav_frame, style="Panel.TFrame")
             nav_header.pack(fill="x", pady=(0, 6))
-            self.nav_title_label = ttk.Label(nav_header, text="Ordnerstruktur", style="SectionTitle.TLabel")
+            self.nav_title_label = ttk.Label(nav_header, text=self._t("nav.tree"), style="SectionTitle.TLabel")
             self.nav_title_label.pack(side="left", anchor="w")
-            ttk.Button(
+            self.nav_toggle_button = ttk.Button(
                 nav_header,
                 text="⇆",
                 width=3,
                 style="Toolbar.TButton",
                 command=self._toggle_nav_mode,
-            ).pack(side="right")
+            )
+            self.nav_toggle_button.pack(side="right")
+            self.nav_toggle_button.bind("<Enter>", self._show_nav_toggle_tooltip)
+            self.nav_toggle_button.bind("<Motion>", self._move_nav_toggle_tooltip)
+            self.nav_toggle_button.bind("<Leave>", self._hide_nav_toggle_tooltip)
 
             self.dir_tree = ttk.Treeview(nav_frame, show="tree")
             nav_scroll = ttk.Scrollbar(nav_frame, orient="vertical", command=self.dir_tree.yview)
@@ -304,11 +322,12 @@ def launch_gui() -> int:
             content_pane.add(list_frame, weight=2)
             content_pane.add(thumb_frame, weight=3)
 
-            ttk.Label(
+            self.model_list_title_label = ttk.Label(
                 list_frame,
-                text="Modell-Liste (.stl / .blend)",
+                text=self._t("model_list.title"),
                 style="SectionTitle.TLabel",
-            ).pack(anchor="w", pady=(0, 6))
+            )
+            self.model_list_title_label.pack(anchor="w", pady=(0, 6))
 
             self.file_table = ttk.Treeview(
                 list_frame,
@@ -316,10 +335,10 @@ def launch_gui() -> int:
                 show="headings",
                 height=18,
             )
-            self.file_table.heading("status", text="Status", command=lambda: self._on_table_heading_click("status"))
-            self.file_table.heading("name", text="Name", command=lambda: self._on_table_heading_click("name"))
-            self.file_table.heading("size", text="Größe", command=lambda: self._on_table_heading_click("size"))
-            self.file_table.heading("date", text="Datum", command=lambda: self._on_table_heading_click("date"))
+            self.file_table.heading("status", text=self._t("table.status"), command=lambda: self._on_table_heading_click("status"))
+            self.file_table.heading("name", text=self._t("table.name"), command=lambda: self._on_table_heading_click("name"))
+            self.file_table.heading("size", text=self._t("table.size"), command=lambda: self._on_table_heading_click("size"))
+            self.file_table.heading("date", text=self._t("table.date"), command=lambda: self._on_table_heading_click("date"))
             self.file_table.column("status", width=54, minwidth=54, stretch=False, anchor="center")
             self.file_table.column("name", width=280, anchor="w")
             self.file_table.column("size", width=110, anchor="e")
@@ -334,18 +353,17 @@ def launch_gui() -> int:
             self.file_table.pack(side="left", fill="both", expand=True)
             table_scroll.pack(side="right", fill="y")
             self.file_context_menu = tk.Menu(self.root, tearoff=0)
-            self.file_context_menu.add_command(label="Open in Explorer", command=self._open_selected_in_explorer)
-            self.file_context_menu.add_command(label="Open in Blender", command=self._open_selected_in_blender)
-            self.file_context_menu.add_command(
-                label="Open in Bambu Studio", command=self._open_selected_in_bambu_studio
-            )
+            self.file_context_menu.add_command(label=self._t("context.open_explorer"), command=self._open_selected_in_explorer)
+            self.file_context_menu.add_command(label=self._t("context.open_blender"), command=self._open_selected_in_blender)
+            self.file_context_menu.add_command(label=self._t("context.open_bambu"), command=self._open_selected_in_bambu_studio)
             self.file_table.bind("<Button-3>", self._on_file_table_context_menu)
 
             preview_header = ttk.Frame(thumb_frame, style="Panel.TFrame")
             preview_header.pack(fill="x", pady=(0, 6))
             preview_title_wrap = ttk.Frame(preview_header, style="Panel.TFrame")
             preview_title_wrap.pack(side="left", fill="x", expand=True)
-            ttk.Label(preview_title_wrap, text="Vorschau", style="SectionTitle.TLabel").pack(
+            self.preview_title_label = ttk.Label(preview_title_wrap, text=self._t("preview.title"), style="SectionTitle.TLabel")
+            self.preview_title_label.pack(
                 side="left", anchor="w"
             )
             self.preview_dir_label = ttk.Label(
@@ -394,7 +412,8 @@ def launch_gui() -> int:
 
             footer = ttk.Frame(footer_area, padding=(8, 6, 8, 8), style="Top.TFrame")
             footer.pack(fill="both", expand=True)
-            ttk.Label(footer, text="Aktivitätsprotokoll", style="Title.TLabel").pack(anchor="w")
+            self.activity_title_label = ttk.Label(footer, text=self._t("activity.title"), style="Title.TLabel")
+            self.activity_title_label.pack(anchor="w")
             log_row = ttk.Frame(footer)
             log_row.pack(fill="both", expand=True, pady=(4, 0))
             self.log_text = tk.Text(log_row, height=5, wrap="word", state="disabled")
@@ -433,6 +452,9 @@ def launch_gui() -> int:
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
 
+        def _t(self, key: str, **kwargs) -> str:
+            return tr(self.language, key, **kwargs)
+
         def _config_int(self, key: str, default: int) -> int:
             value = self.gui_config.get(key)
             if not isinstance(value, int) or value <= 0:
@@ -467,6 +489,9 @@ def launch_gui() -> int:
                 return value
             return default
 
+        def _config_language(self, key: str, default: str) -> str:
+            return normalize_language(self.gui_config.get(key, default))
+
         def _resolve_index_dir(self, value, fallback: Path) -> Path:
             if not isinstance(value, str) or not value.strip():
                 return fallback.resolve()
@@ -494,6 +519,7 @@ def launch_gui() -> int:
                 "image_ext": self.image_ext,
                 "renderer": self.renderer,
                 "blender_preset": self.blender_preset,
+                "language": self.language,
                 "blender_path": str(self.blender_path) if self.blender_path else "",
                 "bambu_studio_path": str(self.bambu_studio_path) if self.bambu_studio_path else "",
             }
@@ -536,9 +562,17 @@ def launch_gui() -> int:
 
         def _set_path_text(self):
             self.path_label.config(
-                text=(
-                    f"Startverzeichnis: {self.source} | Indexverzeichnis: {self.index_dir}"
-                    f" | Render: {self.render_width}x{self.render_height} {self.image_ext} ({self.renderer}/{self.blender_preset}, T={self.render_threads}, Rand={self.render_margin:.2f})"
+                text=self._t(
+                    "path.info",
+                    source=self.source,
+                    index_dir=self.index_dir,
+                    width=self.render_width,
+                    height=self.render_height,
+                    ext=self.image_ext,
+                    renderer=self.renderer,
+                    preset=self.blender_preset,
+                    threads=self.render_threads,
+                    margin=self.render_margin,
                 )
             )
 
@@ -549,33 +583,44 @@ def launch_gui() -> int:
             self.stat_existing.config(text=str(self.summary.images_available))
             self.stat_todo.config(text=str(self.summary.images_to_generate))
 
+        def _apply_language_to_ui(self):
+            self.root.title(self._t("app.title"))
+            self._build_menu()
+            self.btn_rescan.config(text=self._t("toolbar.rescan"))
+            self.btn_render_current.config(text=self._t("toolbar.render_current"))
+            self.btn_render_all.config(text=self._t("toolbar.render_all"))
+            self.btn_abort.config(text=self._t("toolbar.abort"))
+            self.btn_delete_index.config(text=self._t("toolbar.delete_index"))
+            self.search_label.config(text=self._t("toolbar.search"))
+            self.btn_clear_search.config(text=self._t("toolbar.search_clear"))
+            self.stat_stl_title.config(text=self._t("stats.stl"))
+            self.stat_blend_title.config(text=self._t("stats.blend_only"))
+            self.stat_total_title.config(text=self._t("stats.total"))
+            self.stat_existing_title.config(text=self._t("stats.images"))
+            self.stat_todo_title.config(text=self._t("stats.todo"))
+            self.nav_title_label.config(text=self._t("nav.timeline") if self._is_timeline_mode() else self._t("nav.tree"))
+            self.model_list_title_label.config(text=self._t("model_list.title"))
+            self.preview_title_label.config(text=self._t("preview.title"))
+            self.activity_title_label.config(text=self._t("activity.title"))
+            self.progress_title_label.config(text=self._t("progress.label"))
+            self.file_context_menu.entryconfig(0, label=self._t("context.open_explorer"))
+            self.file_context_menu.entryconfig(1, label=self._t("context.open_blender"))
+            self.file_context_menu.entryconfig(2, label=self._t("context.open_bambu"))
+            self._set_path_text()
+            self._update_table_heading_indicators()
+            if self.nav_toggle_tooltip_label is not None:
+                self.nav_toggle_tooltip_label.config(text=self._nav_toggle_tooltip_text())
+            self._build_tree()
+            self._refresh_current_view()
+
         def _is_timeline_mode(self) -> bool:
-            return self.nav_mode.get() == "Zeitstrahl"
+            return self.nav_mode.get() == "timeline"
 
         def _timeline_keys(self, groups: dict[str, list[Path]]) -> list[str]:
             return sorted(groups.keys(), reverse=True)
 
-        @staticmethod
-        def _month_label(month_key: str) -> str:
-            months = {
-                "01": "Januar",
-                "02": "Februar",
-                "03": "März",
-                "04": "April",
-                "05": "Mai",
-                "06": "Juni",
-                "07": "Juli",
-                "08": "August",
-                "09": "September",
-                "10": "Oktober",
-                "11": "November",
-                "12": "Dezember",
-            }
-            parts = month_key.split("-", 1)
-            if len(parts) != 2:
-                return month_key
-            year, month = parts
-            return f"{months.get(month, month)} {year}"
+        def _month_label(self, month_key: str) -> str:
+            return month_label(self.language, month_key)
 
         def _build_timeline_groups(self) -> dict[str, list[Path]]:
             groups: dict[str, list[Path]] = {}
@@ -596,13 +641,52 @@ def launch_gui() -> int:
 
         def _toggle_nav_mode(self):
             if self._is_timeline_mode():
-                self.nav_mode.set("Ordnerstruktur")
+                self.nav_mode.set("tree")
             else:
-                self.nav_mode.set("Zeitstrahl")
+                self.nav_mode.set("timeline")
             self._on_nav_mode_changed()
 
+        def _nav_toggle_tooltip_text(self) -> str:
+            if self._is_timeline_mode():
+                return self._t("nav.switch_to_tree")
+            return self._t("nav.switch_to_timeline")
+
+        def _show_nav_toggle_tooltip(self, event=None):
+            if self.nav_toggle_tooltip_win is None or not self.nav_toggle_tooltip_win.winfo_exists():
+                self.nav_toggle_tooltip_win = tk.Toplevel(self.root)
+                self.nav_toggle_tooltip_win.overrideredirect(True)
+                self.nav_toggle_tooltip_win.attributes("-topmost", True)
+                self.nav_toggle_tooltip_label = tk.Label(
+                    self.nav_toggle_tooltip_win,
+                    text=self._nav_toggle_tooltip_text(),
+                    bg="#1f2d3d",
+                    fg="#ffffff",
+                    padx=8,
+                    pady=4,
+                    relief="solid",
+                    bd=1,
+                )
+                self.nav_toggle_tooltip_label.pack()
+            elif self.nav_toggle_tooltip_label is not None:
+                self.nav_toggle_tooltip_label.config(text=self._nav_toggle_tooltip_text())
+            self._move_nav_toggle_tooltip(event)
+            self.nav_toggle_tooltip_win.deiconify()
+
+        def _move_nav_toggle_tooltip(self, event=None):
+            if self.nav_toggle_tooltip_win is None or not self.nav_toggle_tooltip_win.winfo_exists():
+                return
+            x = self.root.winfo_pointerx() + 14
+            y = self.root.winfo_pointery() + 14
+            self.nav_toggle_tooltip_win.geometry(f"+{x}+{y}")
+
+        def _hide_nav_toggle_tooltip(self, _event=None):
+            if self.nav_toggle_tooltip_win is not None and self.nav_toggle_tooltip_win.winfo_exists():
+                self.nav_toggle_tooltip_win.withdraw()
+
         def _on_nav_mode_changed(self):
-            self.nav_title_label.config(text=self.nav_mode.get())
+            self.nav_title_label.config(text=self._t("nav.timeline") if self._is_timeline_mode() else self._t("nav.tree"))
+            if self.nav_toggle_tooltip_label is not None:
+                self.nav_toggle_tooltip_label.config(text=self._nav_toggle_tooltip_text())
             self._build_tree()
             self._refresh_current_view()
 
@@ -612,7 +696,7 @@ def launch_gui() -> int:
                 if not groups:
                     self.selected_timeline_key = None
                     self.selected_timeline_year = None
-                    self._show_models([], "Zeitstrahl")
+                    self._show_models([], self._t("nav.timeline"))
                     return
                 if self.selected_timeline_year:
                     self._show_timeline_year(self.selected_timeline_year)
@@ -698,7 +782,7 @@ def launch_gui() -> int:
                                 self.dir_tree.selection_set(tree_id)
                                 self.dir_tree.see(tree_id)
                             self._show_timeline_year(prev_year)
-                            self._append_log(f"Zeitstrahl: vorheriges Jahr -> {prev_year}")
+                            self._append_log(self._t("timeline.prev_year", year=prev_year))
                 elif self.selected_timeline_key and self.selected_timeline_key in keys:
                     idx = keys.index(self.selected_timeline_key)
                     if idx - 1 >= 0:
@@ -709,7 +793,7 @@ def launch_gui() -> int:
                             self.dir_tree.selection_set(tree_id)
                             self.dir_tree.see(tree_id)
                         self._show_timeline_month(prev_key)
-                        self._append_log(f"Zeitstrahl: vorheriger Monat -> {self._month_label(prev_key)}")
+                        self._append_log(self._t("timeline.prev_month", month=self._month_label(prev_key)))
                 return
             top, bottom = self.thumb_canvas.yview()
             page = max(0.08, bottom - top)
@@ -736,7 +820,7 @@ def launch_gui() -> int:
                                 self.dir_tree.selection_set(tree_id)
                                 self.dir_tree.see(tree_id)
                             self._show_timeline_year(next_year)
-                            self._append_log(f"Zeitstrahl: nächstes Jahr -> {next_year}")
+                            self._append_log(self._t("timeline.next_year", year=next_year))
                 elif self.selected_timeline_key in keys:
                     idx = keys.index(self.selected_timeline_key)
                     if idx + 1 < len(keys):
@@ -747,12 +831,12 @@ def launch_gui() -> int:
                             self.dir_tree.selection_set(tree_id)
                             self.dir_tree.see(tree_id)
                         self._show_timeline_month(next_key)
-                        self._append_log(f"Zeitstrahl: nächster Monat -> {self._month_label(next_key)}")
+                        self._append_log(self._t("timeline.next_month", month=self._month_label(next_key)))
                 return
             next_dir = self._next_directory_for_paging(self.selected_directory)
             if next_dir is not None:
                 self._select_directory(next_dir)
-                self._append_log(f"Paging: nächstes Verzeichnis -> {next_dir}")
+                self._append_log(self._t("paging.next_dir", directory=next_dir))
 
         def _set_status(self, text: str):
             self.status_label.config(text=text)
@@ -911,7 +995,7 @@ def launch_gui() -> int:
 
         def _start_initial_scan(self, force: bool = False):
             if self.render_running:
-                self._set_status("Scan übersprungen: Hintergrund-Rendering läuft.")
+                self._set_status(self._t("scan.skipped_render_running"))
                 return
 
             if not force:
@@ -924,15 +1008,15 @@ def launch_gui() -> int:
                     self._set_summary_text()
                     self._build_tree()
                     self._refresh_current_view()
-                    self._set_status("Scan aus Cache geladen.")
+                    self._set_status(self._t("scan.loaded_cache"))
                     self._clear_progress()
                     self._clear_activity()
-                    self._append_log("Scan-Cache verwendet (frischer Stand).")
+                    self._append_log(self._t("scan.cache_used"))
                     return
 
             self._set_path_text()
-            self._set_status("Ordnerstruktur wird geladen ...")
-            self._set_activity("Initialer Scan läuft ...")
+            self._set_status(self._t("scan.loading_tree"))
+            self._set_activity(self._t("state.initial_scan"))
             self._set_progress_indeterminate()
             thread = threading.Thread(target=self._initial_scan_worker, daemon=True)
             thread.start()
@@ -962,8 +1046,8 @@ def launch_gui() -> int:
                 self.directory_snapshot = event[1]
                 self._build_tree()
                 self._refresh_current_view()
-                self._set_status("Ordnerstruktur geladen. Dateiscan läuft ...")
-                self._append_log(f"Ordnerstruktur geladen ({len(self.directory_snapshot)} Verzeichnisse).")
+                self._set_status(self._t("scan.tree_loaded_scanning"))
+                self._append_log(self._t("scan.tree_loaded_n", count=len(self.directory_snapshot)))
             elif kind == "scan_complete":
                 self.summary = event[1]
                 directories = event[2]
@@ -971,7 +1055,7 @@ def launch_gui() -> int:
                 self.directory_snapshot = directories
                 self.model_records = model_records
                 self._set_summary_text()
-                self._set_status("Scan abgeschlossen.")
+                self._set_status(self._t("scan.complete"))
                 self._clear_progress()
                 if not self.render_running:
                     self._clear_activity()
@@ -979,30 +1063,35 @@ def launch_gui() -> int:
                 self._build_tree()
                 self._refresh_current_view()
                 self._append_log(
-                    f"Scan abgeschlossen: STLs={self.summary.stl_count}, BLEND-only={self.summary.blend_only_count}, Gesamt={self.summary.total_models}, Bilder={self.summary.images_available}, neu={self.summary.images_to_generate}"
+                    self._t(
+                        "scan.complete.log",
+                        stl=self.summary.stl_count,
+                        blend_only=self.summary.blend_only_count,
+                        total=self.summary.total_models,
+                        images=self.summary.images_available,
+                        todo=self.summary.images_to_generate,
+                    )
                 )
             elif kind == "scan_error":
-                self._set_status(f"Scan fehlgeschlagen: {event[1]}")
+                self._set_status(self._t("scan.failed", error=event[1]))
                 self._clear_progress()
                 self._clear_activity()
-                self._append_log(f"Scan-Fehler: {event[1]}")
+                self._append_log(self._t("scan.error_log", error=event[1]))
             elif kind == "render_started":
                 total, scope_label = event[1], event[2]
                 self.render_progress = RenderProgress(total=total)
                 self.render_running = True
-                self._set_status(f"Hintergrund-Rendering gestartet ({scope_label}).")
-                self._set_activity(f"Rendering läuft: 0/{total}")
+                self._set_status(self._t("render.started_status", scope=scope_label))
+                self._set_activity(self._t("render.running", done=0, total=total))
                 self._set_progress(0, max(1, total))
                 self._refresh_table_statuses()
                 self._append_log(
-                    f"Rendering gestartet: scope={scope_label}, renderer={self.renderer}, aufgaben={total}"
+                    self._t("render.started_log", scope=scope_label, renderer=self.renderer, tasks=total)
                 )
             elif kind == "render_collecting":
                 scanned, queued, scope_label = event[1], event[2], event[3]
-                self._set_status(f"Hintergrund-Rendering wird vorbereitet ({scope_label}).")
-                self._set_activity(
-                    f"Dateiliste wird erstellt: geprüft {scanned}, zu rendern {queued}"
-                )
+                self._set_status(self._t("render.preparing_status", scope=scope_label))
+                self._set_activity(self._t("render.preparing_activity", scanned=scanned, queued=queued))
             elif kind == "render_progress":
                 if self.render_progress is None:
                     return
@@ -1027,15 +1116,21 @@ def launch_gui() -> int:
                 self._set_summary_text()
                 self._set_progress(self.render_progress.processed, max(1, self.render_progress.total))
                 self._set_activity(
-                    f"Rendering läuft: {self.render_progress.processed}/{self.render_progress.total} | "
-                    f"OK: {self.render_progress.succeeded} Fehler: {self.render_progress.failed} | {filename}"
+                    self._t(
+                        "render.running_detail",
+                        done=self.render_progress.processed,
+                        total=self.render_progress.total,
+                        ok=self.render_progress.succeeded,
+                        failed=self.render_progress.failed,
+                        file=filename,
+                    )
                 )
                 self._refresh_table_statuses()
                 self._update_thumbnail_for_model(model_path, in_progress=False)
                 if ok:
-                    self._append_log(f"OK: {filename} -> {out_path}")
+                    self._append_log(self._t("log.ok", file=filename, target=out_path))
                 else:
-                    self._append_log(f"FEHLER: {filename} -> {err} | Ziel: {out_path}")
+                    self._append_log(self._t("log.error", file=filename, error=err, target=out_path))
             elif kind == "render_done":
                 self.render_running = False
                 self.current_render_scope = None
@@ -1043,13 +1138,11 @@ def launch_gui() -> int:
                 self.current_render_dir = None
                 self.render_inflight_paths.clear()
                 rendered, failed = event[1], event[2]
-                self._set_status(
-                    f"Hintergrund-Rendering abgeschlossen. Neu erzeugt: {rendered}, Fehler: {failed}"
-                )
+                self._set_status(self._t("render.done_status", rendered=rendered, failed=failed))
                 self._clear_progress()
                 self._clear_activity()
                 self._refresh_current_view()
-                self._append_log(f"Rendering abgeschlossen: erzeugt={rendered}, fehler={failed}")
+                self._append_log(self._t("render.done_log", rendered=rendered, failed=failed))
             elif kind == "render_cancelled":
                 self.render_running = False
                 self.current_render_scope = None
@@ -1057,25 +1150,21 @@ def launch_gui() -> int:
                 self.current_render_dir = None
                 self.render_inflight_paths.clear()
                 rendered, failed, remaining = event[1], event[2], event[3]
-                self._set_status(
-                    f"Rendering abgebrochen. Neu erzeugt: {rendered}, Fehler: {failed}, offen: {remaining}"
-                )
+                self._set_status(self._t("render.cancel_status", rendered=rendered, failed=failed, remaining=remaining))
                 self._clear_progress()
                 self._clear_activity()
                 self._refresh_current_view()
-                self._append_log(
-                    f"Rendering abgebrochen: erzeugt={rendered}, fehler={failed}, offen={remaining}"
-                )
+                self._append_log(self._t("render.cancel_log", rendered=rendered, failed=failed, remaining=remaining))
             elif kind == "render_error":
                 self.render_running = False
                 self.current_render_scope = None
                 self.current_render_overwrite = False
                 self.current_render_dir = None
                 self.render_inflight_paths.clear()
-                self._set_status(f"Rendering fehlgeschlagen: {event[1]}")
+                self._set_status(self._t("render.failed_status", error=event[1]))
                 self._clear_progress()
                 self._clear_activity()
-                self._append_log(f"Rendering-Fehler: {event[1]}")
+                self._append_log(self._t("render.failed_log", error=event[1]))
             elif kind == "render_task_start":
                 model_path = Path(event[1]).resolve()
                 self.render_inflight_paths.add(model_path)
@@ -1086,13 +1175,13 @@ def launch_gui() -> int:
                     return
                 done, total = event[1], event[2]
                 self._set_progress(done, max(1, total))
-                self._set_activity(f"Vorschau wird aufgebaut: {done}/{total}")
+                self._set_activity(self._t("preview.building", done=done, total=total))
             elif kind == "thumb_done":
                 if self.render_running:
                     return
                 self._clear_progress()
                 self._clear_activity()
-                self._set_status("Vorschau aktualisiert.")
+                self._set_status(self._t("preview.updated"))
             elif kind == "log":
                 self._append_log(event[1])
 
@@ -1217,10 +1306,10 @@ def launch_gui() -> int:
 
         def _update_table_heading_indicators(self):
             titles = {
-                "status": "Status",
-                "name": "Name",
-                "size": "Größe",
-                "date": "Datum",
+                "status": self._t("table.status"),
+                "name": self._t("table.name"),
+                "size": self._t("table.size"),
+                "date": self._t("table.date"),
             }
             arrow = " ▼" if self.table_sort_desc else " ▲"
             for col, base in titles.items():
@@ -1284,8 +1373,8 @@ def launch_gui() -> int:
                 self._open_in_file_manager(self.context_model_path)
                 self._append_log(f"Open in Explorer: {self.context_model_path}")
             except Exception as exc:
-                messagebox.showerror("Fehler", f"Konnte Dateimanager nicht öffnen:\n{exc}")
-                self._append_log(f"Open in Explorer fehlgeschlagen: {exc}")
+                messagebox.showerror(self._t("dialog.error"), self._t("open.explorer.error", error=exc))
+                self._append_log(self._t("open.explorer.error_log", error=exc))
 
         def _detect_bambu_studio_executable(self) -> Path | None:
             found = shutil.which("bambu-studio") or shutil.which("BambuStudio") or shutil.which("bambu_studio")
@@ -1319,32 +1408,35 @@ def launch_gui() -> int:
                 return
             blender_exe = detect_blender_executable(self.blender_path)
             if blender_exe is None:
-                messagebox.showerror("Fehler", "Blender wurde nicht gefunden.")
-                self._append_log("Open in Blender fehlgeschlagen: Blender nicht gefunden.")
+                messagebox.showerror(self._t("dialog.error"), self._t("open.blender.not_found"))
+                self._append_log(self._t("open.blender.not_found_log"))
                 return
             try:
                 subprocess.Popen([str(blender_exe), str(self.context_model_path)])
                 self._append_log(f"Open in Blender: {self.context_model_path}")
             except Exception as exc:
-                messagebox.showerror("Fehler", f"Konnte Blender nicht starten:\n{exc}")
-                self._append_log(f"Open in Blender fehlgeschlagen: {exc}")
+                messagebox.showerror(self._t("dialog.error"), self._t("open.blender.start_error", error=exc))
+                self._append_log(self._t("open.blender.start_error_log", error=exc))
 
         def _open_selected_in_bambu_studio(self):
             if self.context_model_path is None:
+                return
+            if self.context_model_path.suffix.lower() != ".stl":
+                self._append_log(self._t("open.bambu.skip_non_stl", path=self.context_model_path))
                 return
             bambu_exe = self.bambu_studio_path
             if not (bambu_exe and bambu_exe.exists() and bambu_exe.is_file()):
                 bambu_exe = self._detect_bambu_studio_executable()
             if bambu_exe is None:
-                messagebox.showerror("Fehler", "Bambu Studio wurde nicht gefunden.")
-                self._append_log("Open in Bambu Studio fehlgeschlagen: Bambu Studio nicht gefunden.")
+                messagebox.showerror(self._t("dialog.error"), self._t("open.bambu.not_found"))
+                self._append_log(self._t("open.bambu.not_found_log"))
                 return
             try:
                 subprocess.Popen([str(bambu_exe), str(self.context_model_path)])
                 self._append_log(f"Open in Bambu Studio: {self.context_model_path}")
             except Exception as exc:
-                messagebox.showerror("Fehler", f"Konnte Bambu Studio nicht starten:\n{exc}")
-                self._append_log(f"Open in Bambu Studio fehlgeschlagen: {exc}")
+                messagebox.showerror(self._t("dialog.error"), self._t("open.bambu.start_error", error=exc))
+                self._append_log(self._t("open.bambu.start_error_log", error=exc))
 
         def _on_file_table_context_menu(self, event):
             row_id = self.file_table.identify_row(event.y)
@@ -1355,6 +1447,10 @@ def launch_gui() -> int:
             if model is None:
                 return
             self.context_model_path = model
+            self.file_context_menu.entryconfig(
+                self._t("context.open_bambu"),
+                state=("normal" if model.suffix.lower() == ".stl" else "disabled"),
+            )
             try:
                 self.file_context_menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -1529,10 +1625,10 @@ def launch_gui() -> int:
             exact = {p for p in candidates if self._file_matches_exact(p, query)}
             if exact:
                 matches = exact
-                mode = "exakt"
+                mode = self._t("search.exact")
             else:
                 matches = {p for p in candidates if self._file_matches_fuzzy(p, query)}
-                mode = "fuzzy"
+                mode = self._t("search.fuzzy")
 
             self.search_match_files = matches
             dirs: set[Path] = set()
@@ -1548,7 +1644,7 @@ def launch_gui() -> int:
             self.search_match_dirs = dirs
             self._build_tree()
             self._refresh_current_view()
-            self._append_log(f"Suche '{query}': {len(matches)} Treffer ({mode}).")
+            self._append_log(self._t("search.result", query=query, count=len(matches), mode=mode))
 
         def _clear_search(self):
             if self.search_after_id is not None:
@@ -1579,10 +1675,10 @@ def launch_gui() -> int:
                 widget.destroy()
 
             if not stl_files:
-                ttk.Label(self.thumb_inner, text="Keine STL-Dateien in diesem Verzeichnis.").pack(
+                ttk.Label(self.thumb_inner, text=self._t("preview.none_files")).pack(
                     anchor="w", padx=10, pady=10
                 )
-                self._set_status("Keine STL-Dateien in diesem Verzeichnis.")
+                self._set_status(self._t("preview.none_files_status"))
                 self._clear_progress()
                 self._clear_activity()
                 return
@@ -1596,7 +1692,7 @@ def launch_gui() -> int:
                 self.thumb_inner.columnconfigure(c, weight=1)
             if update_progress and not self.render_running:
                 self._set_progress(0, len(stl_files))
-                self._set_activity(f"Vorschau wird aufgebaut: 0/{len(stl_files)}")
+                self._set_activity(self._t("preview.building", done=0, total=len(stl_files)))
 
             def build_chunk(start_index: int):
                 if token != self.thumb_job_token:
@@ -1649,7 +1745,7 @@ def launch_gui() -> int:
                 child.destroy()
 
             if in_progress:
-                ttk.Label(holder, text="Bild wird erzeugt ...").place(relx=0.5, rely=0.5, anchor="center")
+                ttk.Label(holder, text=self._t("preview.generating")).place(relx=0.5, rely=0.5, anchor="center")
                 return
 
             if out_path.exists():
@@ -1668,15 +1764,15 @@ def launch_gui() -> int:
                     self._bind_thumbnail_hover(lbl, model_path)
                     return
                 except tk.TclError:
-                    ttk.Label(holder, text="Vorschau kann nicht geladen werden.").place(
+                    ttk.Label(holder, text=self._t("preview.unavailable")).place(
                         relx=0.5, rely=0.5, anchor="center"
                     )
                     return
-            ttk.Label(holder, text="Kein Bild im Index vorhanden.").place(relx=0.5, rely=0.5, anchor="center")
+            ttk.Label(holder, text=self._t("preview.no_image")).place(relx=0.5, rely=0.5, anchor="center")
 
         def start_background_render(self, scope: str, overwrite: bool):
             if self.render_running:
-                messagebox.showinfo("Info", "Ein Hintergrund-Rendering läuft bereits.")
+                messagebox.showinfo(self._t("dialog.info"), self._t("render.already_running"))
                 return
             self.render_running = True
             self.render_cancel_event.clear()
@@ -1685,11 +1781,22 @@ def launch_gui() -> int:
             self.current_render_dir = self.selected_directory
             self.render_inflight_paths.clear()
             self._clear_progress()
-            scope_text = "aktuelles Verzeichnis" if scope == "current" else "gesamtes Startverzeichnis"
-            self._set_status(f"Hintergrund-Rendering wird vorbereitet ({scope_text}) ...")
-            self._set_activity("Dateiliste wird erstellt ...")
+            scope_text = self._t("render.scope.current") if scope == "current" else self._t("render.scope.all")
+            self._set_status(self._t("render.preparing_status", scope=scope_text))
+            self._set_activity(self._t("render.preparing_simple"))
             self._append_log(
-                f"Render-Auftrag angenommen: scope={scope_text}, overwrite={overwrite}, renderer={self.renderer}, preset={self.blender_preset}, threads={self.render_threads}, rand={self.render_margin:.2f}, größe={self.render_width}x{self.render_height}, format={self.image_ext}"
+                self._t(
+                    "render.request_log",
+                    scope=scope_text,
+                    overwrite=overwrite,
+                    renderer=self.renderer,
+                    preset=self.blender_preset,
+                    threads=self.render_threads,
+                    margin=self.render_margin,
+                    width=self.render_width,
+                    height=self.render_height,
+                    ext=self.image_ext,
+                )
             )
             self._refresh_table_statuses()
             current_dir = self.selected_directory
@@ -1702,11 +1809,11 @@ def launch_gui() -> int:
 
         def abort_background_render(self):
             if not self.render_running:
-                messagebox.showinfo("Info", "Es läuft aktuell kein Hintergrund-Rendering.")
+                messagebox.showinfo(self._t("dialog.info"), self._t("render.none_running"))
                 return
             self.render_cancel_event.set()
-            self._set_status("Abbruch angefordert ...")
-            self._set_activity("Rendering wird nach der aktuellen Datei gestoppt.")
+            self._set_status(self._t("render.abort_requested"))
+            self._set_activity(self._t("render.abort_activity"))
 
         def _render_worker(self, scope: str, current_dir: Path, overwrite: bool):
             try:
@@ -1715,18 +1822,18 @@ def launch_gui() -> int:
                     blender_exe = detect_blender_executable(self.blender_path)
                     if blender_exe is None:
                         self.ui_queue.put(
-                            ("render_error", "Blender nicht gefunden. Bitte Pfad in Einstellungen setzen oder Blender in PATH aufnehmen.")
+                            ("render_error", self._t("render.blender_not_found"))
                         )
                         return
                     effective_blender_path = blender_exe
-                    self.ui_queue.put(("log", f"Blender gefunden: {blender_exe}"))
+                    self.ui_queue.put(("log", self._t("render.blender_found", path=blender_exe)))
 
                 if scope == "current":
                     stl_files = list(iter_render_sources_in_directory(current_dir))
-                    scope_label = f"aktuelles Verzeichnis ({current_dir})"
+                    scope_label = self._t("render.scope.current_with_dir", directory=current_dir)
                 else:
                     stl_files = list(iter_render_sources(self.source, self.index_dir))
-                    scope_label = "gesamtes Startverzeichnis"
+                    scope_label = self._t("render.scope.all_plain")
                 tasks = []
                 for idx, stl in enumerate(stl_files, start=1):
                     if self.render_cancel_event.is_set():
@@ -1748,7 +1855,7 @@ def launch_gui() -> int:
                     return
 
                 max_workers = max(1, self.render_threads)
-                self.ui_queue.put(("log", f"Starte paralleles Rendering mit {max_workers} Thread(s)."))
+                self.ui_queue.put(("log", self._t("render.parallel_log", threads=max_workers)))
 
                 def worker_task(stl: Path, out_path: Path, missing_preview: bool):
                     try:
@@ -1825,18 +1932,18 @@ def launch_gui() -> int:
         def change_start_dir(self):
             if self.render_running:
                 messagebox.showinfo(
-                    "Info",
-                    "Startverzeichnis kann während eines Hintergrund-Renderings nicht geändert werden.",
+                    self._t("dialog.info"),
+                    self._t("change_dir.blocked"),
                 )
                 return
             new_dir = filedialog.askdirectory(
-                title="Startverzeichnis wählen", initialdir=str(self.source)
+                title=self._t("dialog.start_dir"), initialdir=str(self.source)
             )
             if not new_dir:
                 return
             path = Path(new_dir)
             if not path.exists() or not path.is_dir():
-                messagebox.showerror("Fehler", "Ungültiges Verzeichnis.")
+                messagebox.showerror(self._t("dialog.error"), self._t("dialog.invalid_dir"))
                 return
 
             self.source = path.resolve()
@@ -1850,13 +1957,13 @@ def launch_gui() -> int:
         def open_config_dialog(self):
             if self.render_running:
                 messagebox.showinfo(
-                    "Info",
-                    "Einstellungen können während eines Hintergrund-Renderings nicht geändert werden.",
+                    self._t("dialog.info"),
+                    self._t("settings.blocked"),
                 )
                 return
 
             dialog = tk.Toplevel(self.root)
-            dialog.title("Einstellungen")
+            dialog.title(self._t("settings.title"))
             dialog.transient(self.root)
             dialog.grab_set()
             dialog.resizable(False, False)
@@ -1875,95 +1982,105 @@ def launch_gui() -> int:
             blender_var = tk.StringVar(value=str(self.blender_path) if self.blender_path else "")
             bambu_var = tk.StringVar(value=str(self.bambu_studio_path) if self.bambu_studio_path else "")
 
-            ttk.Label(frame, text="Indexverzeichnis").grid(row=0, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=index_var, width=56).grid(row=1, column=0, sticky="we", pady=(0, 6))
+            ttk.Label(frame, text=self._t("settings.language")).grid(row=0, column=0, sticky="w", pady=4)
+            language_labels = {
+                "de": self._t("settings.lang_de"),
+                "en": self._t("settings.lang_en"),
+            }
+            language_values = [language_labels[code] for code in LANGUAGE_CHOICES]
+            language_combo = ttk.Combobox(frame, values=language_values, state="readonly", width=18)
+            language_combo.grid(row=1, column=0, sticky="w", pady=(0, 6))
+            language_combo.set(language_labels.get(self.language, language_labels["de"]))
+
+            ttk.Label(frame, text=self._t("settings.index_dir")).grid(row=2, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=index_var, width=56).grid(row=3, column=0, sticky="we", pady=(0, 6))
 
             def browse_index_dir():
                 selected = filedialog.askdirectory(
-                    title="Indexverzeichnis wählen", initialdir=str(self.source)
+                    title=self._t("settings.index_dir"), initialdir=str(self.source)
                 )
                 if selected:
                     index_var.set(selected)
 
-            ttk.Button(frame, text="Auswählen ...", command=browse_index_dir).grid(
-                row=1, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
+            ttk.Button(frame, text=self._t("settings.select_dir"), command=browse_index_dir).grid(
+                row=3, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
             )
 
-            ttk.Label(frame, text="Render-Breite (px)").grid(row=2, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=width_var, width=16).grid(row=3, column=0, sticky="w", pady=(0, 6))
+            ttk.Label(frame, text=self._t("settings.width")).grid(row=4, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=width_var, width=16).grid(row=5, column=0, sticky="w", pady=(0, 6))
 
-            ttk.Label(frame, text="Render-Höhe (px)").grid(row=4, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=height_var, width=16).grid(row=5, column=0, sticky="w", pady=(0, 6))
+            ttk.Label(frame, text=self._t("settings.height")).grid(row=6, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=height_var, width=16).grid(row=7, column=0, sticky="w", pady=(0, 6))
 
-            ttk.Label(frame, text="Render-Threads").grid(row=6, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.threads")).grid(row=8, column=0, sticky="w", pady=4)
             ttk.Entry(frame, textvariable=threads_var, width=16).grid(
-                row=7, column=0, sticky="w", pady=(0, 6)
-            )
-
-            ttk.Label(frame, text="Bildrand (0.00 - 1.00)").grid(row=8, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=margin_var, width=16).grid(
                 row=9, column=0, sticky="w", pady=(0, 6)
             )
 
-            ttk.Label(frame, text="Bildformat").grid(row=10, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.margin")).grid(row=10, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=margin_var, width=16).grid(
+                row=11, column=0, sticky="w", pady=(0, 6)
+            )
+
+            ttk.Label(frame, text=self._t("settings.image_ext")).grid(row=12, column=0, sticky="w", pady=4)
             ttk.Combobox(
                 frame, textvariable=ext_var, values=GUI_EXT_CHOICES, state="readonly", width=12
-            ).grid(row=11, column=0, sticky="w", pady=(0, 10))
+            ).grid(row=13, column=0, sticky="w", pady=(0, 10))
 
-            ttk.Label(frame, text="Renderer").grid(row=12, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.renderer")).grid(row=14, column=0, sticky="w", pady=4)
             ttk.Combobox(
                 frame, textvariable=renderer_var, values=RENDERER_CHOICES, state="readonly", width=14
-            ).grid(row=13, column=0, sticky="w", pady=(0, 6))
+            ).grid(row=15, column=0, sticky="w", pady=(0, 6))
 
-            ttk.Label(frame, text="Blender-Preset").grid(row=14, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.blender_preset")).grid(row=16, column=0, sticky="w", pady=4)
             ttk.Combobox(
                 frame,
                 textvariable=preset_var,
                 values=BLENDER_PRESET_CHOICES,
                 state="readonly",
                 width=14,
-            ).grid(row=15, column=0, sticky="w", pady=(0, 6))
+            ).grid(row=17, column=0, sticky="w", pady=(0, 6))
 
-            ttk.Separator(frame, orient="horizontal").grid(row=16, column=0, columnspan=2, sticky="we", pady=(8, 8))
-            ttk.Label(frame, text="Programmpfade", style="SectionTitle.TLabel").grid(row=17, column=0, sticky="w", pady=(0, 4))
+            ttk.Separator(frame, orient="horizontal").grid(row=18, column=0, columnspan=2, sticky="we", pady=(8, 8))
+            ttk.Label(frame, text=self._t("settings.program_paths"), style="SectionTitle.TLabel").grid(row=19, column=0, sticky="w", pady=(0, 4))
             ttk.Button(
                 frame,
-                text="Autodetect",
+                text=self._t("settings.autodetect"),
                 command=lambda: autodetect_program_paths(),
-            ).grid(row=17, column=1, sticky="e", pady=(0, 4))
+            ).grid(row=19, column=1, sticky="e", pady=(0, 4))
 
-            ttk.Label(frame, text="Blender-Pfad (optional)").grid(row=18, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.blender_path")).grid(row=20, column=0, sticky="w", pady=4)
             ttk.Entry(frame, textvariable=blender_var, width=56).grid(
-                row=19, column=0, sticky="we", pady=(0, 6)
+                row=21, column=0, sticky="we", pady=(0, 6)
             )
 
             def browse_blender_path():
                 selected = filedialog.askopenfilename(
-                    title="Blender-Executable wählen",
-                    filetypes=[("Executable", "*.exe"), ("Alle Dateien", "*.*")],
+                    title=self._t("settings.select_blender_exe"),
+                    filetypes=[(self._t("settings.filetype_exe"), "*.exe"), (self._t("settings.filetype_all"), "*.*")],
                 )
                 if selected:
                     blender_var.set(selected)
 
-            ttk.Button(frame, text="Datei wählen ...", command=browse_blender_path).grid(
-                row=19, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
+            ttk.Button(frame, text=self._t("settings.select_file"), command=browse_blender_path).grid(
+                row=21, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
             )
 
-            ttk.Label(frame, text="Bambu-Studio-Pfad (optional)").grid(row=20, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text=self._t("settings.bambu_path")).grid(row=22, column=0, sticky="w", pady=4)
             ttk.Entry(frame, textvariable=bambu_var, width=56).grid(
-                row=21, column=0, sticky="we", pady=(0, 6)
+                row=23, column=0, sticky="we", pady=(0, 6)
             )
 
             def browse_bambu_path():
                 selected = filedialog.askopenfilename(
-                    title="Bambu-Studio-Executable wählen",
-                    filetypes=[("Executable", "*.exe"), ("Alle Dateien", "*.*")],
+                    title=self._t("settings.select_bambu_exe"),
+                    filetypes=[(self._t("settings.filetype_exe"), "*.exe"), (self._t("settings.filetype_all"), "*.*")],
                 )
                 if selected:
                     bambu_var.set(selected)
 
-            ttk.Button(frame, text="Datei wählen ...", command=browse_bambu_path).grid(
-                row=21, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
+            ttk.Button(frame, text=self._t("settings.select_file"), command=browse_bambu_path).grid(
+                row=23, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
             )
 
             def autodetect_program_paths():
@@ -1979,12 +2096,12 @@ def launch_gui() -> int:
                 if bambu_exe:
                     found_bits.append("Bambu Studio")
                 if found_bits:
-                    self._append_log(f"Autodetect Programmpfade: gefunden {', '.join(found_bits)}")
+                    self._append_log(self._t("settings.autodetect_found", items=", ".join(found_bits)))
                 else:
-                    self._append_log("Autodetect Programmpfade: nichts gefunden.")
+                    self._append_log(self._t("settings.autodetect_none"))
 
             button_row = ttk.Frame(frame)
-            button_row.grid(row=22, column=0, columnspan=2, sticky="e")
+            button_row.grid(row=24, column=0, columnspan=2, sticky="e")
 
             def apply_settings():
                 try:
@@ -1993,31 +2110,37 @@ def launch_gui() -> int:
                     threads = int(threads_var.get().strip())
                     margin = float(margin_var.get().strip().replace(",", "."))
                 except ValueError:
-                    messagebox.showerror("Fehler", "Breite/Höhe/Threads müssen Zahlen sein; Bildrand eine Dezimalzahl.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_numeric"))
                     return
                 if width <= 0 or height <= 0:
-                    messagebox.showerror("Fehler", "Breite und Höhe müssen größer als 0 sein.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_dimensions"))
                     return
                 if threads <= 0:
-                    messagebox.showerror("Fehler", "Threads müssen größer als 0 sein.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_threads"))
                     return
                 if margin < 0.0 or margin > 1.0:
-                    messagebox.showerror("Fehler", "Bildrand muss zwischen 0.00 und 1.00 liegen.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_margin"))
                     return
                 ext = ext_var.get().strip().lower()
                 if ext not in GUI_EXT_CHOICES:
-                    messagebox.showerror("Fehler", "Ungültiges Bildformat.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_image_ext"))
                     return
                 renderer = renderer_var.get().strip().lower()
                 if renderer not in RENDERER_CHOICES:
-                    messagebox.showerror("Fehler", "Ungültiger Renderer.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_renderer"))
                     return
                 blender_preset = preset_var.get().strip().lower()
                 if blender_preset not in BLENDER_PRESET_CHOICES:
-                    messagebox.showerror("Fehler", "Ungültiges Blender-Preset.")
+                    messagebox.showerror(self._t("dialog.error"), self._t("settings.err_preset"))
                     return
                 blender_path = self._resolve_optional_path(blender_var.get())
                 bambu_path = self._resolve_optional_path(bambu_var.get())
+                selected_lang_label = language_combo.get().strip()
+                selected_lang = "de"
+                for code, label in language_labels.items():
+                    if label == selected_lang_label:
+                        selected_lang = code
+                        break
 
                 self.render_width = width
                 self.render_height = height
@@ -2026,42 +2149,44 @@ def launch_gui() -> int:
                 self.image_ext = ext
                 self.renderer = renderer
                 self.blender_preset = blender_preset
+                self.language = normalize_language(selected_lang)
                 self.blender_path = blender_path
                 self.bambu_studio_path = bambu_path
                 self.index_dir = self._resolve_index_dir(index_var.get(), self._default_index_for_source())
                 self._save_gui_config()
+                self._apply_language_to_ui()
                 self._set_path_text()
-                self._set_status("Einstellungen gespeichert.")
+                self._set_status(self._t("settings.saved"))
                 dialog.destroy()
                 self._start_initial_scan()
 
-            ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(
+            ttk.Button(button_row, text=self._t("settings.cancel"), command=dialog.destroy).pack(
                 side="right", padx=(8, 0)
             )
-            ttk.Button(button_row, text="Speichern", command=apply_settings).pack(side="right")
+            ttk.Button(button_row, text=self._t("settings.save"), command=apply_settings).pack(side="right")
 
             dialog.wait_window(dialog)
 
         def delete_index_directory(self):
             if self.render_running:
                 messagebox.showinfo(
-                    "Info",
-                    "Index kann während eines Hintergrund-Renderings nicht gelöscht werden.",
+                    self._t("dialog.info"),
+                    self._t("delete_index.blocked"),
                 )
                 return
 
             if not self.index_dir.exists():
-                messagebox.showinfo("Info", f"Indexverzeichnis existiert nicht:\n{self.index_dir}")
-                self._append_log(f"Index-Löschen übersprungen (nicht vorhanden): {self.index_dir}")
+                messagebox.showinfo(self._t("dialog.info"), self._t("delete_index.not_exists", path=self.index_dir))
+                self._append_log(self._t("delete_index.skip_log", path=self.index_dir))
                 return
 
             confirm = messagebox.askyesno(
-                "Index löschen",
-                f"Soll das Indexverzeichnis wirklich gelöscht werden?\n\n{self.index_dir}",
+                self._t("delete_index.confirm_title"),
+                self._t("delete_index.confirm_text", path=self.index_dir),
                 icon="warning",
             )
             if not confirm:
-                self._append_log("Index-Löschen abgebrochen (Benutzerabbruch).")
+                self._append_log(self._t("delete_index.cancel_log"))
                 return
 
             try:
@@ -2069,18 +2194,18 @@ def launch_gui() -> int:
                 self.summary.images_available = 0
                 self.summary.images_to_generate = self.summary.total_models
                 self._set_summary_text()
-                self._set_status("Indexverzeichnis gelöscht.")
+                self._set_status(self._t("delete_index.done_status"))
                 self._set_activity("")
                 self._refresh_current_view()
-                self._append_log(f"Indexverzeichnis gelöscht: {self.index_dir}")
+                self._append_log(self._t("delete_index.done_log", path=self.index_dir))
                 self._start_initial_scan()
             except Exception as exc:
-                messagebox.showerror("Fehler", f"Index konnte nicht gelöscht werden:\n{exc}")
-                self._set_status("Index-Löschen fehlgeschlagen.")
-                self._append_log(f"Index-Löschen fehlgeschlagen: {exc}")
+                messagebox.showerror(self._t("dialog.error"), self._t("delete_index.failed", error=exc))
+                self._set_status(self._t("delete_index.failed_status"))
+                self._append_log(self._t("delete_index.failed_log", error=exc))
 
         def on_close(self):
-            print("STL Preview wird beendet ... Bitte kurz warten.", flush=True)
+            print(self._t("close.terminating"), flush=True)
             if self.hover_preview_win is not None and self.hover_preview_win.winfo_exists():
                 self.hover_preview_win.destroy()
             save_last_start_dir(self.source)
@@ -2089,17 +2214,23 @@ def launch_gui() -> int:
 
     root = tk.Tk()
     root.withdraw()
+    boot_cfg = load_app_config()
+    boot_gui_cfg = boot_cfg.get("gui", {}) if isinstance(boot_cfg.get("gui"), dict) else {}
+    boot_lang = normalize_language(boot_gui_cfg.get("language", "de"))
 
     start_dir = load_last_start_dir()
     if start_dir is None:
-        selected = filedialog.askdirectory(title="Startverzeichnis wählen")
+        selected = filedialog.askdirectory(title=tr(boot_lang, "dialog.start_dir"))
         if not selected:
             root.destroy()
             return 0
         start_dir = Path(selected)
 
     if not start_dir.exists() or not start_dir.is_dir():
-        messagebox.showerror("Fehler", f"Startverzeichnis existiert nicht: {start_dir}")
+        messagebox.showerror(
+            tr(boot_lang, "dialog.error"),
+            tr(boot_lang, "dialog.start_dir_not_exists", path=start_dir),
+        )
         root.destroy()
         return 2
 
