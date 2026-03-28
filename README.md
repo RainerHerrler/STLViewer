@@ -5,6 +5,22 @@ A tool with two modes:
 - GUI mode (no arguments): directory browser with model list (`.stl` / `.blend`) and thumbnail preview
 - CLI mode (with arguments): renders preview images recursively into an index directory
 
+## What This Is For
+
+This project is designed for managing large personal collections of 3D-print models.
+When you have thousands of files across many folders and years, it becomes hard to find the right model again.
+
+STL Preview solves this by building and maintaining a visual index:
+
+- scans `.stl` and `.blend` files and generates preview images
+- keeps previews up to date based on file timestamps
+- lets you browse by folder structure or timeline
+- provides fast search (including fuzzy matching for typos)
+- shows file status, metadata, and render activity
+- supports quick handoff to external tools (for example Blender/Bambu Studio from context menu)
+
+In short: it is a fast visual browser for your own model archive, so you can rediscover models quickly and get to printing faster.
+
 ## Screenshot
 
 <img src="screenshot.png" alt="STL Preview Screenshot" width="1400" />
