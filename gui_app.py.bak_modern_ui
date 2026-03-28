@@ -1,0 +1,958 @@
+from __future__ import annotations
+
+import concurrent.futures
+import math
+import queue
+import shutil
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from config_store import (
+    load_app_config,
+    load_last_start_dir,
+    save_app_config,
+    save_last_start_dir,
+)
+from constants import (
+    BLENDER_PRESET_CHOICES,
+    GUI_EXT_CHOICES,
+    GUI_IMAGE_EXT,
+    RENDERER_CHOICES,
+)
+from renderers import detect_blender_executable, render_stl
+from scanner import (
+    ScanSummary,
+    collect_directories,
+    iter_render_sources,
+    iter_render_sources_in_directory,
+    list_display_files,
+    needs_render,
+    scan_summary,
+    target_image_path,
+)
+
+
+@dataclass
+class RenderProgress:
+    total: int = 0
+    processed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+
+
+def format_file_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def launch_gui() -> int:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    class STLPreviewApp:
+        def __init__(self, root: tk.Tk, source: Path):
+            self.root = root
+            self.root.title("STL Preview Index Browser")
+            self.root.geometry("1300x800")
+            self.root.minsize(980, 640)
+
+            self.source = source.resolve()
+            self.config = load_app_config()
+            self.gui_config = self.config.get("gui", {}) if isinstance(self.config.get("gui"), dict) else {}
+            self.render_width = self._config_int("render_width", 500)
+            self.render_height = self._config_int("render_height", 300)
+            self.render_threads = self._config_int("render_threads", 4)
+            self.image_ext = self._config_ext("image_ext", GUI_IMAGE_EXT)
+            self.renderer = self._config_renderer("renderer", "blender")
+            self.blender_preset = self._config_blender_preset("blender_preset", "kontrast")
+            self.blender_path = self._resolve_optional_path(self.gui_config.get("blender_path"))
+            self.index_dir = self._resolve_index_dir(
+                self.gui_config.get("index_dir"), self.source / "Index"
+            )
+            self.tree_paths: dict[str, Path] = {}
+            self.thumbnail_cache: list[tk.PhotoImage] = []
+            self.directory_snapshot: list[Path] = []
+            self.summary = ScanSummary()
+            self.render_progress: RenderProgress | None = None
+            self.render_running = False
+            self.render_cancel_event = threading.Event()
+            self.thumb_job_token = 0
+            self.ui_queue: queue.Queue[tuple] = queue.Queue()
+            self.selected_directory = self.source
+
+            self._build_menu()
+            self._build_layout()
+            self._set_path_text()
+            self._set_status("Bereit.")
+            self._set_activity("Initialer Scan läuft ...")
+            self._append_log("GUI gestartet.")
+            self._set_progress_indeterminate()
+            self.root.after(100, self._process_ui_queue)
+            self._start_initial_scan()
+
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        def _build_menu(self):
+            menubar = tk.Menu(self.root)
+            file_menu = tk.Menu(menubar, tearoff=0)
+            file_menu.add_command(label="Startverzeichnis ändern...", command=self.change_start_dir)
+            file_menu.add_command(label="Einstellungen...", command=self.open_config_dialog)
+            file_menu.add_command(label="Neu scannen", command=self._start_initial_scan)
+            file_menu.add_command(label="Lösche Index", command=self.delete_index_directory)
+            file_menu.add_separator()
+            file_menu.add_command(label="Beenden", command=self.on_close)
+            menubar.add_cascade(label="Datei", menu=file_menu)
+
+            render_menu = tk.Menu(menubar, tearoff=0)
+            render_menu.add_command(
+                label="Starten (gesamtes Startverzeichnis)",
+                command=lambda: self.start_background_render("all"),
+            )
+            render_menu.add_command(
+                label="Starten (aktuelles Verzeichnis)",
+                command=lambda: self.start_background_render("current"),
+            )
+            render_menu.add_separator()
+            render_menu.add_command(label="Abbrechen", command=self.abort_background_render)
+            menubar.add_cascade(label="Rendern", menu=render_menu)
+
+            self.root.config(menu=menubar)
+
+        def _build_layout(self):
+            header = ttk.Frame(self.root, padding=10)
+            header.pack(fill="x")
+
+            self.path_label = ttk.Label(header, text="", anchor="w")
+            self.path_label.pack(fill="x")
+
+            self.stats_label = ttk.Label(header, text="", anchor="w")
+            self.stats_label.pack(fill="x", pady=(4, 0))
+
+            status_row = ttk.Frame(header)
+            status_row.pack(fill="x", pady=(6, 0))
+            self.status_label = ttk.Label(status_row, text="", anchor="w")
+            self.status_label.pack(fill="x")
+
+            activity_row = ttk.Frame(header)
+            activity_row.pack(fill="x", pady=(4, 0))
+            self.activity_label = ttk.Label(activity_row, text="", anchor="w")
+            self.activity_label.pack(side="left", fill="x", expand=True)
+            self.progress_bar = ttk.Progressbar(activity_row, mode="determinate", length=260)
+            self.progress_bar.pack(side="right")
+
+            separator = ttk.Separator(self.root, orient="horizontal")
+            separator.pack(fill="x")
+
+            vertical_pane = ttk.PanedWindow(self.root, orient="vertical")
+            vertical_pane.pack(fill="both", expand=True)
+
+            main_area = ttk.Frame(vertical_pane)
+            footer_area = ttk.Frame(vertical_pane)
+            vertical_pane.add(main_area, weight=5)
+            vertical_pane.add(footer_area, weight=1)
+
+            # Set a practical initial split (can be changed by user via sash drag).
+            self.root.after(50, lambda: vertical_pane.sashpos(0, max(420, self.root.winfo_height() - 190)))
+
+            main_pane = ttk.PanedWindow(main_area, orient="horizontal")
+            main_pane.pack(fill="both", expand=True)
+
+            nav_frame = ttk.Frame(main_pane, padding=(8, 8, 4, 8))
+            content_pane = ttk.PanedWindow(main_pane, orient="horizontal")
+            main_pane.add(nav_frame, weight=1)
+            main_pane.add(content_pane, weight=3)
+
+            ttk.Label(nav_frame, text="Ordnerstruktur").pack(anchor="w", pady=(0, 6))
+
+            self.dir_tree = ttk.Treeview(nav_frame, show="tree")
+            nav_scroll = ttk.Scrollbar(nav_frame, orient="vertical", command=self.dir_tree.yview)
+            self.dir_tree.configure(yscrollcommand=nav_scroll.set)
+            self.dir_tree.pack(side="left", fill="both", expand=True)
+            nav_scroll.pack(side="right", fill="y")
+            self.dir_tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+
+            list_frame = ttk.Frame(content_pane, padding=(4, 8, 4, 8))
+            thumb_frame = ttk.Frame(content_pane, padding=(4, 8, 8, 8))
+            content_pane.add(list_frame, weight=2)
+            content_pane.add(thumb_frame, weight=3)
+
+            ttk.Label(list_frame, text="Modell-Liste (.stl / .blend)").pack(anchor="w", pady=(0, 6))
+
+            self.file_table = ttk.Treeview(
+                list_frame,
+                columns=("name", "size", "date"),
+                show="headings",
+                height=18,
+            )
+            self.file_table.heading("name", text="Name")
+            self.file_table.heading("size", text="Größe")
+            self.file_table.heading("date", text="Datum")
+            self.file_table.column("name", width=280, anchor="w")
+            self.file_table.column("size", width=110, anchor="e")
+            self.file_table.column("date", width=170, anchor="w")
+
+            table_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_table.yview)
+            self.file_table.configure(yscrollcommand=table_scroll.set)
+            self.file_table.pack(side="left", fill="both", expand=True)
+            table_scroll.pack(side="right", fill="y")
+
+            ttk.Label(thumb_frame, text="Vorschau (Index)").pack(anchor="w", pady=(0, 6))
+
+            self.thumb_canvas = tk.Canvas(thumb_frame, highlightthickness=0)
+            self.thumb_scroll = ttk.Scrollbar(
+                thumb_frame, orient="vertical", command=self.thumb_canvas.yview
+            )
+            self.thumb_canvas.configure(yscrollcommand=self.thumb_scroll.set)
+
+            self.thumb_inner = ttk.Frame(self.thumb_canvas)
+            self.thumb_window = self.thumb_canvas.create_window(
+                (0, 0), window=self.thumb_inner, anchor="nw"
+            )
+
+            self.thumb_inner.bind(
+                "<Configure>",
+                lambda _: self.thumb_canvas.configure(scrollregion=self.thumb_canvas.bbox("all")),
+            )
+            self.thumb_canvas.bind("<Configure>", self._on_canvas_resize)
+
+            self.thumb_canvas.pack(side="left", fill="both", expand=True)
+            self.thumb_scroll.pack(side="right", fill="y")
+
+            footer_sep = ttk.Separator(footer_area, orient="horizontal")
+            footer_sep.pack(fill="x")
+
+            footer = ttk.Frame(footer_area, padding=(8, 6, 8, 8))
+            footer.pack(fill="both", expand=True)
+            ttk.Label(footer, text="Aktivitätsprotokoll").pack(anchor="w")
+            log_row = ttk.Frame(footer)
+            log_row.pack(fill="both", expand=True, pady=(4, 0))
+            self.log_text = tk.Text(log_row, height=6, wrap="word", state="disabled")
+            log_scroll = ttk.Scrollbar(log_row, orient="vertical", command=self.log_text.yview)
+            self.log_text.configure(yscrollcommand=log_scroll.set)
+            self.log_text.pack(side="left", fill="both", expand=True)
+            log_scroll.pack(side="right", fill="y")
+
+        def _append_log(self, message: str):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", f"[{timestamp}] {message}\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+        def _config_int(self, key: str, default: int) -> int:
+            value = self.gui_config.get(key)
+            if not isinstance(value, int) or value <= 0:
+                return default
+            return value
+
+        def _config_ext(self, key: str, default: str) -> str:
+            value = self.gui_config.get(key)
+            if isinstance(value, str) and value in GUI_EXT_CHOICES:
+                return value
+            return default
+
+        def _config_renderer(self, key: str, default: str) -> str:
+            value = self.gui_config.get(key)
+            if value == "auto":
+                return "blender"
+            if isinstance(value, str) and value in RENDERER_CHOICES:
+                return value
+            return default
+
+        def _config_blender_preset(self, key: str, default: str) -> str:
+            value = self.gui_config.get(key)
+            if isinstance(value, str) and value in BLENDER_PRESET_CHOICES:
+                return value
+            return default
+
+        def _resolve_index_dir(self, value, fallback: Path) -> Path:
+            if not isinstance(value, str) or not value.strip():
+                return fallback.resolve()
+            index_path = Path(value.strip()).expanduser()
+            if not index_path.is_absolute():
+                index_path = (self.source / index_path).resolve()
+            return index_path.resolve()
+
+        def _resolve_optional_path(self, value) -> Path | None:
+            if not isinstance(value, str) or not value.strip():
+                return None
+            return Path(value.strip()).expanduser().resolve()
+
+        def _save_gui_config(self):
+            # Reload before writing so we do not overwrite fields saved elsewhere
+            # (for example last_start_dir) with stale in-memory data.
+            cfg = load_app_config()
+            cfg["last_start_dir"] = str(self.source.resolve())
+            cfg["gui"] = {
+                "index_dir": str(self.index_dir),
+                "render_width": self.render_width,
+                "render_height": self.render_height,
+                "render_threads": self.render_threads,
+                "image_ext": self.image_ext,
+                "renderer": self.renderer,
+                "blender_preset": self.blender_preset,
+                "blender_path": str(self.blender_path) if self.blender_path else "",
+            }
+            save_app_config(cfg)
+            self.config = cfg
+
+        def _default_index_for_source(self) -> Path:
+            return (self.source / "Index").resolve()
+
+        def _set_activity(self, text: str):
+            self.activity_label.config(text=text)
+
+        def _clear_activity(self):
+            self.activity_label.config(text="")
+
+        def _on_canvas_resize(self, event):
+            self.thumb_canvas.itemconfigure(self.thumb_window, width=event.width)
+
+        def _set_path_text(self):
+            self.path_label.config(
+                text=(
+                    f"Startverzeichnis: {self.source} | Indexverzeichnis: {self.index_dir}"
+                    f" | Render: {self.render_width}x{self.render_height} {self.image_ext} ({self.renderer}/{self.blender_preset}, T={self.render_threads})"
+                )
+            )
+
+        def _set_summary_text(self):
+            self.stats_label.config(
+                text=(
+                    f"STLs: {self.summary.stl_count}   |   Blender-Dateien (ohne STL): {self.summary.blend_only_count}"
+                    f"   |   Gesamt: {self.summary.total_models}"
+                    f"   |   Bilder vorhanden: {self.summary.images_available}"
+                    f"   |   Neu zu erzeugen: {self.summary.images_to_generate}"
+                )
+            )
+
+        def _set_status(self, text: str):
+            self.status_label.config(text=text)
+
+        def _set_progress_indeterminate(self):
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start(12)
+
+        def _set_progress(self, value: int, maximum: int):
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", maximum=max(1, maximum), value=value)
+
+        def _clear_progress(self):
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", maximum=1, value=0)
+
+        def _start_initial_scan(self):
+            if self.render_running:
+                self._set_status("Scan übersprungen: Hintergrund-Rendering läuft.")
+                return
+            self._set_path_text()
+            self._set_status("Ordnerstruktur wird geladen ...")
+            self._set_activity("Initialer Scan läuft ...")
+            self._set_progress_indeterminate()
+            thread = threading.Thread(target=self._initial_scan_worker, daemon=True)
+            thread.start()
+
+        def _initial_scan_worker(self):
+            try:
+                directories = collect_directories(self.source, self.index_dir)
+                self.ui_queue.put(("dirs_ready", directories))
+                summary = scan_summary(self.source, self.index_dir, self.image_ext)
+                self.ui_queue.put(("scan_complete", summary))
+            except Exception as exc:
+                self.ui_queue.put(("scan_error", str(exc)))
+
+        def _process_ui_queue(self):
+            while True:
+                try:
+                    event = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_ui_event(event)
+            self.root.after(100, self._process_ui_queue)
+
+        def _handle_ui_event(self, event: tuple):
+            kind = event[0]
+            if kind == "dirs_ready":
+                self.directory_snapshot = event[1]
+                self._build_tree()
+                self._show_directory(self.selected_directory)
+                self._set_status("Ordnerstruktur geladen. Dateiscan läuft ...")
+                self._append_log(f"Ordnerstruktur geladen ({len(self.directory_snapshot)} Verzeichnisse).")
+            elif kind == "scan_complete":
+                self.summary = event[1]
+                self._set_summary_text()
+                self._set_status("Scan abgeschlossen.")
+                self._clear_progress()
+                if not self.render_running:
+                    self._clear_activity()
+                self._append_log(
+                    f"Scan abgeschlossen: STLs={self.summary.stl_count}, BLEND-only={self.summary.blend_only_count}, Gesamt={self.summary.total_models}, Bilder={self.summary.images_available}, neu={self.summary.images_to_generate}"
+                )
+            elif kind == "scan_error":
+                self._set_status(f"Scan fehlgeschlagen: {event[1]}")
+                self._clear_progress()
+                self._clear_activity()
+                self._append_log(f"Scan-Fehler: {event[1]}")
+            elif kind == "render_started":
+                total, scope_label = event[1], event[2]
+                self.render_progress = RenderProgress(total=total)
+                self.render_running = True
+                self._set_status(f"Hintergrund-Rendering gestartet ({scope_label}).")
+                self._set_activity(f"Rendering läuft: 0/{total}")
+                self._set_progress(0, max(1, total))
+                self._append_log(
+                    f"Rendering gestartet: scope={scope_label}, renderer={self.renderer}, aufgaben={total}"
+                )
+            elif kind == "render_collecting":
+                scanned, queued, scope_label = event[1], event[2], event[3]
+                self._set_status(f"Hintergrund-Rendering wird vorbereitet ({scope_label}).")
+                self._set_activity(
+                    f"Dateiliste wird erstellt: geprüft {scanned}, zu rendern {queued}"
+                )
+            elif kind == "render_progress":
+                if self.render_progress is None:
+                    return
+                ok, missing_preview, filename, out_path, err = event[1], event[2], event[3], event[4], event[5]
+                self.render_progress.processed += 1
+                if ok:
+                    self.render_progress.succeeded += 1
+                    self.summary.images_to_generate = max(0, self.summary.images_to_generate - 1)
+                    if missing_preview:
+                        self.summary.images_available += 1
+                else:
+                    self.render_progress.failed += 1
+                self._set_summary_text()
+                self._set_progress(self.render_progress.processed, max(1, self.render_progress.total))
+                self._set_activity(
+                    f"Rendering läuft: {self.render_progress.processed}/{self.render_progress.total} | "
+                    f"OK: {self.render_progress.succeeded} Fehler: {self.render_progress.failed} | {filename}"
+                )
+                if ok:
+                    self._append_log(f"OK: {filename} -> {out_path}")
+                else:
+                    self._append_log(f"FEHLER: {filename} -> {err} | Ziel: {out_path}")
+            elif kind == "render_done":
+                self.render_running = False
+                rendered, failed = event[1], event[2]
+                self._set_status(
+                    f"Hintergrund-Rendering abgeschlossen. Neu erzeugt: {rendered}, Fehler: {failed}"
+                )
+                self._clear_progress()
+                self._clear_activity()
+                self._show_directory(self.selected_directory)
+                self._append_log(f"Rendering abgeschlossen: erzeugt={rendered}, fehler={failed}")
+            elif kind == "render_cancelled":
+                self.render_running = False
+                rendered, failed, remaining = event[1], event[2], event[3]
+                self._set_status(
+                    f"Rendering abgebrochen. Neu erzeugt: {rendered}, Fehler: {failed}, offen: {remaining}"
+                )
+                self._clear_progress()
+                self._clear_activity()
+                self._show_directory(self.selected_directory)
+                self._append_log(
+                    f"Rendering abgebrochen: erzeugt={rendered}, fehler={failed}, offen={remaining}"
+                )
+            elif kind == "render_error":
+                self.render_running = False
+                self._set_status(f"Rendering fehlgeschlagen: {event[1]}")
+                self._clear_progress()
+                self._clear_activity()
+                self._append_log(f"Rendering-Fehler: {event[1]}")
+            elif kind == "thumb_progress":
+                if self.render_running:
+                    return
+                done, total = event[1], event[2]
+                self._set_progress(done, max(1, total))
+                self._set_activity(f"Vorschau wird aufgebaut: {done}/{total}")
+            elif kind == "thumb_done":
+                if self.render_running:
+                    return
+                self._clear_progress()
+                self._clear_activity()
+                self._set_status("Vorschau aktualisiert.")
+            elif kind == "log":
+                self._append_log(event[1])
+
+        def _build_tree(self):
+            self.dir_tree.delete(*self.dir_tree.get_children())
+            self.tree_paths.clear()
+
+            root_label = self.source.name if self.source.name else str(self.source)
+            root_id = self.dir_tree.insert("", "end", text=root_label, open=True)
+            self.tree_paths[root_id] = self.source
+            node_ids: dict[Path, str] = {self.source: root_id}
+            for directory in self.directory_snapshot:
+                if directory == self.source:
+                    continue
+                parent = directory.parent
+                parent_id = node_ids.get(parent)
+                if parent_id is None:
+                    continue
+                item_id = self.dir_tree.insert(parent_id, "end", text=directory.name, open=False)
+                self.tree_paths[item_id] = directory
+                node_ids[directory] = item_id
+            self.dir_tree.selection_set(root_id)
+
+        def on_tree_select(self, _event=None):
+            selection = self.dir_tree.selection()
+            if not selection:
+                return
+            path = self.tree_paths.get(selection[0])
+            if path is not None:
+                self.selected_directory = path
+                self._show_directory(path)
+
+        def _show_directory(self, directory: Path):
+            model_files = list_display_files(directory)
+
+            self.file_table.delete(*self.file_table.get_children())
+            for model in model_files:
+                stat = model.stat()
+                modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                self.file_table.insert(
+                    "",
+                    "end",
+                    values=(model.name, format_file_size(stat.st_size), modified),
+                )
+
+            self._populate_thumbnails(model_files)
+
+        def _populate_thumbnails(self, stl_files: list[Path]):
+            self.thumb_job_token += 1
+            token = self.thumb_job_token
+            self.thumbnail_cache.clear()
+            for widget in self.thumb_inner.winfo_children():
+                widget.destroy()
+
+            if not stl_files:
+                ttk.Label(self.thumb_inner, text="Keine STL-Dateien in diesem Verzeichnis.").pack(
+                    anchor="w", padx=10, pady=10
+                )
+                self._set_status("Keine STL-Dateien in diesem Verzeichnis.")
+                self._clear_progress()
+                self._clear_activity()
+                return
+
+            thumb_w, thumb_h = 320, 220
+            columns = 2
+            self.thumb_inner.columnconfigure(0, weight=1)
+            self.thumb_inner.columnconfigure(1, weight=1)
+            if not self.render_running:
+                self._set_progress(0, len(stl_files))
+                self._set_activity(f"Vorschau wird aufgebaut: 0/{len(stl_files)}")
+
+            def build_chunk(start_index: int):
+                if token != self.thumb_job_token:
+                    return
+                end_index = min(start_index + 8, len(stl_files))
+                for idx in range(start_index, end_index):
+                    stl = stl_files[idx]
+                    out_path = target_image_path(stl, self.source, self.index_dir, self.image_ext)
+                    row = idx // columns
+                    col = idx % columns
+                    tile = ttk.Frame(self.thumb_inner, padding=8, relief="ridge")
+                    tile.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+
+                    if out_path.exists():
+                        try:
+                            image = tk.PhotoImage(file=str(out_path))
+                            factor = max(
+                                1,
+                                math.ceil(image.width() / thumb_w),
+                                math.ceil(image.height() / thumb_h),
+                            )
+                            thumb = image.subsample(factor, factor)
+                            self.thumbnail_cache.append(thumb)
+                            ttk.Label(tile, image=thumb).pack(anchor="center")
+                        except tk.TclError:
+                            ttk.Label(tile, text="Vorschau kann nicht geladen werden.").pack(
+                                anchor="center", padx=6, pady=6
+                            )
+                    else:
+                        ttk.Label(tile, text="Kein Bild im Index vorhanden.").pack(
+                            anchor="center", padx=6, pady=6
+                        )
+
+                    ttk.Label(tile, text=stl.name, wraplength=thumb_w, anchor="center").pack(
+                        fill="x", pady=(8, 0)
+                    )
+
+                self.ui_queue.put(("thumb_progress", end_index, len(stl_files)))
+                if end_index < len(stl_files):
+                    self.root.after(1, lambda: build_chunk(end_index))
+                else:
+                    self.ui_queue.put(("thumb_done",))
+
+            self.root.after(1, lambda: build_chunk(0))
+
+        def start_background_render(self, scope: str):
+            if self.render_running:
+                messagebox.showinfo("Info", "Ein Hintergrund-Rendering läuft bereits.")
+                return
+            self.render_running = True
+            self.render_cancel_event.clear()
+            self._clear_progress()
+            scope_text = "aktuelles Verzeichnis" if scope == "current" else "gesamtes Startverzeichnis"
+            self._set_status(f"Hintergrund-Rendering wird vorbereitet ({scope_text}) ...")
+            self._set_activity("Dateiliste wird erstellt ...")
+            self._append_log(
+                f"Render-Auftrag angenommen: scope={scope_text}, renderer={self.renderer}, preset={self.blender_preset}, threads={self.render_threads}, größe={self.render_width}x{self.render_height}, format={self.image_ext}"
+            )
+            current_dir = self.selected_directory
+            thread = threading.Thread(target=self._render_worker, args=(scope, current_dir), daemon=True)
+            thread.start()
+
+        def abort_background_render(self):
+            if not self.render_running:
+                messagebox.showinfo("Info", "Es läuft aktuell kein Hintergrund-Rendering.")
+                return
+            self.render_cancel_event.set()
+            self._set_status("Abbruch angefordert ...")
+            self._set_activity("Rendering wird nach der aktuellen Datei gestoppt.")
+
+        def _render_worker(self, scope: str, current_dir: Path):
+            try:
+                effective_blender_path = self.blender_path
+                if self.renderer == "blender":
+                    blender_exe = detect_blender_executable(self.blender_path)
+                    if blender_exe is None:
+                        self.ui_queue.put(
+                            ("render_error", "Blender nicht gefunden. Bitte Pfad in Einstellungen setzen oder Blender in PATH aufnehmen.")
+                        )
+                        return
+                    effective_blender_path = blender_exe
+                    self.ui_queue.put(("log", f"Blender gefunden: {blender_exe}"))
+
+                if scope == "current":
+                    stl_files = list(iter_render_sources_in_directory(current_dir))
+                    scope_label = f"aktuelles Verzeichnis ({current_dir})"
+                else:
+                    stl_files = list(iter_render_sources(self.source, self.index_dir))
+                    scope_label = "gesamtes Startverzeichnis"
+                tasks = []
+                for idx, stl in enumerate(stl_files, start=1):
+                    if self.render_cancel_event.is_set():
+                        self.ui_queue.put(("render_cancelled", 0, 0, 0))
+                        return
+                    out_path = target_image_path(stl, self.source, self.index_dir, self.image_ext)
+                    if needs_render(stl, out_path, overwrite=False):
+                        tasks.append((stl, out_path, not out_path.exists()))
+                    if idx % 150 == 0:
+                        self.ui_queue.put(("render_collecting", idx, len(tasks), scope_label))
+
+                self.ui_queue.put(("render_started", len(tasks), scope_label))
+
+                success_count = 0
+                failed_count = 0
+                total = len(tasks)
+                if total == 0:
+                    self.ui_queue.put(("render_done", 0, 0))
+                    return
+
+                max_workers = max(1, self.render_threads)
+                self.ui_queue.put(("log", f"Starte paralleles Rendering mit {max_workers} Thread(s)."))
+
+                def worker_task(stl: Path, out_path: Path, missing_preview: bool):
+                    try:
+                        render_stl(
+                            stl,
+                            out_path,
+                            width=self.render_width,
+                            height=self.render_height,
+                            renderer=self.renderer,
+                            blender_path=effective_blender_path,
+                            blender_preset=self.blender_preset,
+                        )
+                        return True, missing_preview, stl.name, str(out_path), ""
+                    except Exception as exc:
+                        return False, missing_preview, stl.name, str(out_path), str(exc)
+
+                processed = 0
+                next_index = 0
+                futures: dict[concurrent.futures.Future, int] = {}
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    while next_index < total and len(futures) < max_workers:
+                        stl, out_path, missing_preview = tasks[next_index]
+                        fut = executor.submit(worker_task, stl, out_path, missing_preview)
+                        futures[fut] = next_index
+                        next_index += 1
+
+                    while futures:
+                        done, _ = concurrent.futures.wait(
+                            list(futures.keys()),
+                            timeout=0.2,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+
+                        if self.render_cancel_event.is_set():
+                            for fut in list(futures.keys()):
+                                fut.cancel()
+
+                        if not done:
+                            continue
+
+                        for fut in done:
+                            futures.pop(fut, None)
+                            if fut.cancelled():
+                                continue
+                            ok, missing_preview, filename, out_path_str, err_msg = fut.result()
+                            if ok:
+                                success_count += 1
+                            else:
+                                failed_count += 1
+                            processed += 1
+                            self.ui_queue.put(
+                                ("render_progress", ok, missing_preview, filename, out_path_str, err_msg)
+                            )
+
+                        if not self.render_cancel_event.is_set():
+                            while next_index < total and len(futures) < max_workers:
+                                stl, out_path, missing_preview = tasks[next_index]
+                                fut = executor.submit(worker_task, stl, out_path, missing_preview)
+                                futures[fut] = next_index
+                                next_index += 1
+
+                remaining = total - processed
+                if self.render_cancel_event.is_set() and remaining > 0:
+                    self.ui_queue.put(("render_cancelled", success_count, failed_count, remaining))
+                else:
+                    self.ui_queue.put(("render_done", success_count, failed_count))
+            except Exception as exc:
+                self.ui_queue.put(("render_error", str(exc)))
+
+        def change_start_dir(self):
+            if self.render_running:
+                messagebox.showinfo(
+                    "Info",
+                    "Startverzeichnis kann während eines Hintergrund-Renderings nicht geändert werden.",
+                )
+                return
+            new_dir = filedialog.askdirectory(
+                title="Startverzeichnis wählen", initialdir=str(self.source)
+            )
+            if not new_dir:
+                return
+            path = Path(new_dir)
+            if not path.exists() or not path.is_dir():
+                messagebox.showerror("Fehler", "Ungültiges Verzeichnis.")
+                return
+
+            self.source = path.resolve()
+            self.selected_directory = self.source
+            self.index_dir = self._default_index_for_source()
+            save_last_start_dir(self.source)
+            self._save_gui_config()
+            self._set_path_text()
+            self._start_initial_scan()
+
+        def open_config_dialog(self):
+            if self.render_running:
+                messagebox.showinfo(
+                    "Info",
+                    "Einstellungen können während eines Hintergrund-Renderings nicht geändert werden.",
+                )
+                return
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Einstellungen")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+
+            frame = ttk.Frame(dialog, padding=12)
+            frame.pack(fill="both", expand=True)
+
+            index_var = tk.StringVar(value=str(self.index_dir))
+            width_var = tk.StringVar(value=str(self.render_width))
+            height_var = tk.StringVar(value=str(self.render_height))
+            threads_var = tk.StringVar(value=str(self.render_threads))
+            ext_var = tk.StringVar(value=self.image_ext)
+            renderer_var = tk.StringVar(value=self.renderer)
+            preset_var = tk.StringVar(value=self.blender_preset)
+            blender_var = tk.StringVar(value=str(self.blender_path) if self.blender_path else "")
+
+            ttk.Label(frame, text="Indexverzeichnis").grid(row=0, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=index_var, width=56).grid(row=1, column=0, sticky="we", pady=(0, 6))
+
+            def browse_index_dir():
+                selected = filedialog.askdirectory(
+                    title="Indexverzeichnis wählen", initialdir=str(self.source)
+                )
+                if selected:
+                    index_var.set(selected)
+
+            ttk.Button(frame, text="Auswählen ...", command=browse_index_dir).grid(
+                row=1, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
+            )
+
+            ttk.Label(frame, text="Render-Breite (px)").grid(row=2, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=width_var, width=16).grid(row=3, column=0, sticky="w", pady=(0, 6))
+
+            ttk.Label(frame, text="Render-Höhe (px)").grid(row=4, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=height_var, width=16).grid(row=5, column=0, sticky="w", pady=(0, 6))
+
+            ttk.Label(frame, text="Render-Threads").grid(row=6, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=threads_var, width=16).grid(
+                row=7, column=0, sticky="w", pady=(0, 6)
+            )
+
+            ttk.Label(frame, text="Bildformat").grid(row=8, column=0, sticky="w", pady=4)
+            ttk.Combobox(
+                frame, textvariable=ext_var, values=GUI_EXT_CHOICES, state="readonly", width=12
+            ).grid(row=9, column=0, sticky="w", pady=(0, 10))
+
+            ttk.Label(frame, text="Renderer").grid(row=10, column=0, sticky="w", pady=4)
+            ttk.Combobox(
+                frame, textvariable=renderer_var, values=RENDERER_CHOICES, state="readonly", width=14
+            ).grid(row=11, column=0, sticky="w", pady=(0, 6))
+
+            ttk.Label(frame, text="Blender-Preset").grid(row=12, column=0, sticky="w", pady=4)
+            ttk.Combobox(
+                frame,
+                textvariable=preset_var,
+                values=BLENDER_PRESET_CHOICES,
+                state="readonly",
+                width=14,
+            ).grid(row=13, column=0, sticky="w", pady=(0, 6))
+
+            ttk.Label(frame, text="Blender-Pfad (optional)").grid(row=14, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=blender_var, width=56).grid(
+                row=15, column=0, sticky="we", pady=(0, 6)
+            )
+
+            def browse_blender_path():
+                selected = filedialog.askopenfilename(
+                    title="Blender-Executable wählen",
+                    filetypes=[("Executable", "*.exe"), ("Alle Dateien", "*.*")],
+                )
+                if selected:
+                    blender_var.set(selected)
+
+            ttk.Button(frame, text="Datei wählen ...", command=browse_blender_path).grid(
+                row=15, column=1, sticky="w", padx=(8, 0), pady=(0, 6)
+            )
+
+            button_row = ttk.Frame(frame)
+            button_row.grid(row=16, column=0, columnspan=2, sticky="e")
+
+            def apply_settings():
+                try:
+                    width = int(width_var.get().strip())
+                    height = int(height_var.get().strip())
+                    threads = int(threads_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Fehler", "Breite, Höhe und Threads müssen ganze Zahlen sein.")
+                    return
+                if width <= 0 or height <= 0:
+                    messagebox.showerror("Fehler", "Breite und Höhe müssen größer als 0 sein.")
+                    return
+                if threads <= 0:
+                    messagebox.showerror("Fehler", "Threads müssen größer als 0 sein.")
+                    return
+                ext = ext_var.get().strip().lower()
+                if ext not in GUI_EXT_CHOICES:
+                    messagebox.showerror("Fehler", "Ungültiges Bildformat.")
+                    return
+                renderer = renderer_var.get().strip().lower()
+                if renderer not in RENDERER_CHOICES:
+                    messagebox.showerror("Fehler", "Ungültiger Renderer.")
+                    return
+                blender_preset = preset_var.get().strip().lower()
+                if blender_preset not in BLENDER_PRESET_CHOICES:
+                    messagebox.showerror("Fehler", "Ungültiges Blender-Preset.")
+                    return
+                blender_path = self._resolve_optional_path(blender_var.get())
+
+                self.render_width = width
+                self.render_height = height
+                self.render_threads = threads
+                self.image_ext = ext
+                self.renderer = renderer
+                self.blender_preset = blender_preset
+                self.blender_path = blender_path
+                self.index_dir = self._resolve_index_dir(index_var.get(), self._default_index_for_source())
+                self._save_gui_config()
+                self._set_path_text()
+                self._set_status("Einstellungen gespeichert.")
+                dialog.destroy()
+                self._start_initial_scan()
+
+            ttk.Button(button_row, text="Abbrechen", command=dialog.destroy).pack(
+                side="right", padx=(8, 0)
+            )
+            ttk.Button(button_row, text="Speichern", command=apply_settings).pack(side="right")
+
+            dialog.wait_window(dialog)
+
+        def delete_index_directory(self):
+            if self.render_running:
+                messagebox.showinfo(
+                    "Info",
+                    "Index kann während eines Hintergrund-Renderings nicht gelöscht werden.",
+                )
+                return
+
+            if not self.index_dir.exists():
+                messagebox.showinfo("Info", f"Indexverzeichnis existiert nicht:\n{self.index_dir}")
+                self._append_log(f"Index-Löschen übersprungen (nicht vorhanden): {self.index_dir}")
+                return
+
+            confirm = messagebox.askyesno(
+                "Index löschen",
+                f"Soll das Indexverzeichnis wirklich gelöscht werden?\n\n{self.index_dir}",
+                icon="warning",
+            )
+            if not confirm:
+                self._append_log("Index-Löschen abgebrochen (Benutzerabbruch).")
+                return
+
+            try:
+                shutil.rmtree(self.index_dir)
+                self.summary.images_available = 0
+                self.summary.images_to_generate = self.summary.total_models
+                self._set_summary_text()
+                self._set_status("Indexverzeichnis gelöscht.")
+                self._set_activity("")
+                self._show_directory(self.selected_directory)
+                self._append_log(f"Indexverzeichnis gelöscht: {self.index_dir}")
+                self._start_initial_scan()
+            except Exception as exc:
+                messagebox.showerror("Fehler", f"Index konnte nicht gelöscht werden:\n{exc}")
+                self._set_status("Index-Löschen fehlgeschlagen.")
+                self._append_log(f"Index-Löschen fehlgeschlagen: {exc}")
+
+        def on_close(self):
+            save_last_start_dir(self.source)
+            self._save_gui_config()
+            self.root.destroy()
+
+    root = tk.Tk()
+    root.withdraw()
+
+    start_dir = load_last_start_dir()
+    if start_dir is None:
+        selected = filedialog.askdirectory(title="Startverzeichnis wählen")
+        if not selected:
+            root.destroy()
+            return 0
+        start_dir = Path(selected)
+
+    if not start_dir.exists() or not start_dir.is_dir():
+        messagebox.showerror("Fehler", f"Startverzeichnis existiert nicht: {start_dir}")
+        root.destroy()
+        return 2
+
+    save_last_start_dir(start_dir)
+    root.deiconify()
+    STLPreviewApp(root, start_dir)
+    root.mainloop()
+    return 0
