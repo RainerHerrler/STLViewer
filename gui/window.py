@@ -39,7 +39,7 @@ from scanner import (
 )
 from gui.models import RenderProgress
 from gui.utils import format_file_size
-from gui.i18n import LANGUAGE_CHOICES, month_label, normalize_language, tr
+from gui.i18n import LANGUAGE_CHOICES, detect_default_language, month_label, normalize_language, tr
 
 
 def launch_gui() -> int:
@@ -64,7 +64,7 @@ def launch_gui() -> int:
             self.image_ext = self._config_ext("image_ext", GUI_IMAGE_EXT)
             self.renderer = self._config_renderer("renderer", "blender")
             self.blender_preset = self._config_blender_preset("blender_preset", "kontrast")
-            self.language = self._config_language("language", "de")
+            self.language = self._config_language("language", detect_default_language())
             self.blender_path = self._resolve_optional_path(self.gui_config.get("blender_path"))
             self.bambu_studio_path = self._resolve_optional_path(self.gui_config.get("bambu_studio_path"))
             self.index_dir = self._resolve_index_dir(
@@ -2216,7 +2216,7 @@ def launch_gui() -> int:
     root.withdraw()
     boot_cfg = load_app_config()
     boot_gui_cfg = boot_cfg.get("gui", {}) if isinstance(boot_cfg.get("gui"), dict) else {}
-    boot_lang = normalize_language(boot_gui_cfg.get("language", "de"))
+    boot_lang = normalize_language(boot_gui_cfg.get("language", detect_default_language()))
 
     start_dir = load_last_start_dir()
     if start_dir is None:

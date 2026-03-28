@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import locale
+import os
 from typing import Final
 
 LANGUAGE_CHOICES: Final[tuple[str, str]] = ("de", "en")
@@ -370,7 +372,39 @@ def normalize_language(value: object) -> str:
         norm = value.strip().lower()
         if norm in LANGUAGE_CHOICES:
             return norm
-    return "de"
+    return "en"
+
+
+def detect_default_language() -> str:
+    # Prefer explicit environment locale settings first (Linux/Unix, sometimes Windows).
+    env_candidates = (
+        os.environ.get("LC_ALL"),
+        os.environ.get("LANGUAGE"),
+        os.environ.get("LC_MESSAGES"),
+        os.environ.get("LANG"),
+    )
+    for raw in env_candidates:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        token = raw.split(":", 1)[0].strip().lower()
+        if token.startswith("de"):
+            return "de"
+        if token.startswith("en"):
+            return "en"
+
+    # Fallback to system locale (works on Windows and Linux).
+    try:
+        loc, _enc = locale.getlocale()
+    except Exception:
+        loc = None
+    if isinstance(loc, str):
+        lo = loc.lower()
+        if lo.startswith("de"):
+            return "de"
+        if lo.startswith("en"):
+            return "en"
+
+    return "en"
 
 
 def tr(language: str, key: str, **kwargs) -> str:

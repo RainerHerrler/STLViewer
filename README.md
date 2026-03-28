@@ -1,22 +1,26 @@
 # STL Preview Index Renderer (Python)
 
-Ein Tool mit zwei Modi:
+A tool with two modes:
 
-- GUI-Modus (ohne Parameter): Verzeichnis-Browser mit Modell-Liste (`.stl`/`.blend`) und Thumbnail-Vorschau
-- CLI-Modus (mit Parametern): rendert Vorschaubilder rekursiv ins Indexverzeichnis
+- GUI mode (no arguments): directory browser with model list (`.stl` / `.blend`) and thumbnail preview
+- CLI mode (with arguments): renders preview images recursively into an index directory
 
-## Projektstruktur
+## Screenshot
 
-- `stl_index_renderer.py`: Entry-Point (CLI + GUI-Start)
-- `gui_app.py`: Kompatibilitäts-Wrapper für GUI-Start
-- `gui/app.py`: schlanker GUI-Entry-Point
-- `gui/window.py`: Hauptlogik der Tkinter-Oberfläche
-- `gui/models.py`: GUI-Datenklassen
-- `gui/utils.py`: GUI-Hilfsfunktionen
-- `renderers.py`: Blender/PyVista/Matplotlib-Renderer
-- `scanner.py`: STL-Scan, Summary, Pfadlogik
-- `config_store.py`: Laden/Speichern der Konfiguration
-- `constants.py`: gemeinsame Konstanten
+![STL Preview Screenshot](screenshot.png)
+
+## Project Structure
+
+- `stl_index_renderer.py`: entry point (CLI + GUI start)
+- `gui_app.py`: compatibility wrapper for GUI start
+- `gui/app.py`: slim GUI entry point
+- `gui/window.py`: main Tkinter UI logic
+- `gui/models.py`: GUI data classes
+- `gui/utils.py`: GUI helper functions
+- `renderers.py`: Blender/PyVista/Matplotlib renderers
+- `scanner.py`: model scan, summary, path logic
+- `config_store.py`: load/save configuration
+- `constants.py`: shared constants
 
 ## Installation
 
@@ -26,70 +30,65 @@ source .venv/bin/activate
 pip install pyvista matplotlib numpy-stl
 ```
 
-Hinweis:
-- Standard-Renderer ist `blender`.
-- Alternativen sind `pyvista` und `matplotlib` (über Einstellungen oder CLI).
-- Blender wird erkannt über:
-  - konfigurierten Blender-Pfad in den GUI-Einstellungen oder
-  - `blender` im `PATH` oder
-  - typische Windows-Installationspfade.
+Notes:
+- Default renderer is `blender`.
+- Alternatives are `pyvista` and `matplotlib` (via settings or CLI).
+- Blender detection order:
+  - configured Blender path in GUI settings, or
+  - `blender` in `PATH`, or
+  - common Windows installation paths.
 
-## GUI-Modus
+## GUI Mode
 
-Start ohne Parameter:
+Start without arguments:
 
 ```bash
 python3 stl_index_renderer.py
 ```
 
-Verhalten:
+Behavior:
 
-- Beim ersten Start wirst du nach einem Startverzeichnis gefragt.
-- Danach wird automatisch das zuletzt verwendete Startverzeichnis genutzt.
-- Das Default-Indexverzeichnis ist `Index` unterhalb des Startverzeichnisses.
-- Initialer Scan läuft im Hintergrund mit Status-/Busy-Anzeige (GUI bleibt bedienbar).
-- Scan-Ergebnis wird im Indexverzeichnis als Cache gespeichert (`.stlpreview_scan_cache.json`).
-- Automatischer Neu-Scan wird nur gestartet, wenn kein Cache vorhanden ist oder der Cache älter als 3 Tage ist.
-- `Neu scannen` erzwingt immer einen frischen Scan.
-- Über `Datei -> Einstellungen...` kannst du Indexverzeichnis, Renderauflösung und Bildformat konfigurieren.
-- Über `Datei -> Einstellungen...` kannst du zusätzlich Renderer und optional den Blender-Pfad konfigurieren.
-- Über `Datei -> Einstellungen...` kannst du zusätzlich ein Blender-Look-Preset wählen (`neutral`, `kontrast`, `dunkelblau`).
-- Über `Datei -> Einstellungen...` kannst du zusätzlich die Anzahl Render-Threads konfigurieren (Default: `4`).
-- Über `Datei -> Einstellungen...` kannst du zusätzlich den Bildrand (`0.00` bis `1.00`) für den Kameraausschnitt einstellen.
-- Im Kopfbereich werden angezeigt:
-  - Anzahl STL-Dateien
-  - Anzahl Blender-Dateien ohne passende STL-Datei
-  - Gesamtanzahl der renderbaren Modelle
-  - Anzahl bereits vorhandener Bilder
-  - Anzahl Bilder, die neu erzeugt werden müssten
-- Zusätzlich gibt es eine eigene Aktivitätszeile mit Fortschrittsbalken.
-- Im Fußbereich zeigt ein mehrzeiliges Aktivitätsprotokoll laufende Schritte und Fehler (z. B. Blender nicht gefunden, Dateifehler).
-- Links: Ordnernavigation unterhalb des Startverzeichnisses
-- Rechts:
-  - Modell-Liste (`.stl` und `.blend`; Name, Größe, Datum)
-  - Thumbnail-Vorschau aus dem Indexverzeichnis
-- Suchfeld in der Toolbar:
-  - durchsucht alle Verzeichnisse nach passenden Modellen
-  - bei keinen Exakt-Treffern wird fuzzy (typo-tolerant) gesucht
-  - passende Ordner werden in der Ordnerstruktur fett dargestellt
-  - die Modell-Liste zeigt nur gefilterte Treffer
-- Menü `Datei`:
-  - `Startverzeichnis ändern...`
-  - `Einstellungen...`
-  - `Neu scannen`
-  - `Lösche Index` (löscht das konfigurierte Indexverzeichnis nach Bestätigung)
-- Menü `Rendern`:
-  - `Starten (gesamtes Startverzeichnis)`
-  - `Starten (aktuelles Verzeichnis)`
-  - `Abbrechen`
+- First start asks for a start directory.
+- Later starts use the last directory automatically.
+- Default index directory is `Index` inside the start directory.
+- Initial scan runs in background with status/busy feedback.
+- Scan result is cached in the index directory (`.stlpreview_scan_cache.json`).
+- Auto re-scan runs only if cache is missing or older than 3 days.
+- `Rescan` always forces a fresh scan.
+- `File -> Settings...` lets you configure index path, resolution and output format.
+- `File -> Settings...` also supports renderer selection and optional Blender path.
+- `File -> Settings...` also supports Blender look presets (`neutral`, `kontrast`, `dunkelblau`).
+- `File -> Settings...` also supports render thread count (default `4`).
+- `File -> Settings...` also supports framing margin (`0.00` to `1.00`).
+- Header shows:
+  - STL file count
+  - Blender files without matching STL
+  - total renderable models
+  - existing images
+  - images to generate
+- Separate activity line with progress bar.
+- Footer activity log shows ongoing steps and errors.
+- Left: folder navigation below start directory.
+- Right:
+  - model list (`.stl` and `.blend`; name, size, date)
+  - thumbnail preview from index directory
+- Search field in toolbar:
+  - searches across all directories
+  - uses fuzzy matching when no exact match exists
+  - model list is filtered to matches
+- `File` menu:
+  - `Change start directory...`
+  - `Settings...`
+  - `Rescan`
+  - `Delete index` (deletes configured index directory after confirmation)
+- `Render` menu:
+  - `Start (whole start directory)`
+  - `Start (current directory)`
+  - `Abort`
 
-Hinweis:
+## CLI Mode
 
-- Der Thumbnail-Aufbau erfolgt schrittweise mit Fortschrittsanzeige.
-
-## CLI-Modus
-
-Beispiel:
+Example:
 
 ```bash
 python3 stl_index_renderer.py \
@@ -101,28 +100,28 @@ python3 stl_index_renderer.py \
   --verbose
 ```
 
-Optionen:
+Options:
 
-- `--source`: Quellverzeichnis (Default: aktuelles Verzeichnis)
-- `--index-dir`: Zielverzeichnis für Bilder (Default: `./index`)
-- `--width`: Bildbreite in Pixel (Default: `500`)
-- `--height`: Bildhöhe in Pixel (Default: `300`)
-- `--ext`: Ausgabeformat (`.png`, `.jpg`, `.jpeg`, `.webp`)
+- `--source`: source directory (default: current directory)
+- `--index-dir`: target image directory (default: `./index`)
+- `--width`: output width in px (default: `500`)
+- `--height`: output height in px (default: `300`)
+- `--ext`: output format (`.png`, `.jpg`, `.jpeg`, `.webp`)
 - `--renderer`: `blender`, `pyvista`, `matplotlib`
-- `--blender-path`: optionaler Pfad zur lokalen Blender-Executable
+- `--blender-path`: optional path to local Blender executable
 - `--blender-preset`: `neutral`, `kontrast`, `dunkelblau`
-- `--framing-margin`: zusätzlicher Rand um das Objekt (`0.0` bis `1.0`, Default `0.18`)
-- GUI-Rendering läuft parallel mit konfigurierbarer Thread-Anzahl (Default `4`).
-- `--overwrite`: Erzwingt Neurendern aller Bilder
-- `--verbose`: Zeigt jede verarbeitete Datei
+- `--framing-margin`: extra margin around object (`0.0` to `1.0`, default `0.18`)
+- GUI rendering uses parallel workers with configurable thread count (default `4`).
+- `--overwrite`: force re-rendering of all images
+- `--verbose`: print every processed file
 
-## Hinweis
+## Note
 
-- Für Rendering wird pro Modellname (`Ordner + Dateiname ohne Endung`) bevorzugt `*.stl` verwendet.
-- Existiert keine STL, wird `*.blend` gerendert.
+- For each model basename (`folder + filename without extension`), `*.stl` is preferred.
+- If no STL exists, `*.blend` is rendered.
 
-## Spenden
+## Donations
 
-Wenn dir das Projekt hilft und du es unterstützen möchtest, sind Spenden willkommen:
+If this project helps you and you want to support it, donations are welcome:
 
-- Kontakt: `herrler@buschtrommel.net`
+- Contact: `herrler@buschtrommel.net`
