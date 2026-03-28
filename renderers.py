@@ -3,11 +3,175 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import time
 from pathlib import Path
 
 from constants import BLENDER_PRESET_CHOICES, RENDERER_CHOICES
+
+# ---------------------------------------------------------------------------
+# Blender script fragments shared between render_stl_blender and
+# render_blend_blender.  Each constant is valid Python at module level so
+# they can be concatenated directly into the embedded script strings.
+# ---------------------------------------------------------------------------
+
+_BLENDER_FORMAT_MAP: dict[str, str] = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+}
+
+# fit_camera_to_points — identical in both Blender scripts.
+# Depends on `width`/`height` being in scope (passed as script args).
+_FIT_CAMERA_SCRIPT = """\
+
+def fit_camera_to_points(cam_obj, cam_data, points, margin):
+    if not points:
+        return
+    fit = 1.0 + margin
+    cam_data.type = "ORTHO"
+    cam_data.shift_x = 0.0
+    cam_data.shift_y = 0.0
+    aspect = max(1e-6, float(width) / max(1.0, float(height)))
+    # Build camera matrix directly from location/rotation (no view_layer.update needed)
+    rot_mat = cam_obj.rotation_euler.to_matrix().to_4x4()
+    cam_quat = cam_obj.rotation_euler.to_quaternion()
+    inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
+    cam_pts = [inv @ p for p in points]
+
+    # Push camera back if objects are too close or behind the camera
+    max_z = max(p.z for p in cam_pts)
+    if max_z > -0.05:
+        shift_z = max_z + 0.5
+        cam_obj.location += cam_quat @ mathutils.Vector((0.0, 0.0, shift_z))
+        inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
+        cam_pts = [inv @ p for p in points]
+
+    min_x = min(p.x for p in cam_pts)
+    max_x = max(p.x for p in cam_pts)
+    min_y = min(p.y for p in cam_pts)
+    max_y = max(p.y for p in cam_pts)
+    min_z = min(p.z for p in cam_pts)
+    max_z = max(p.z for p in cam_pts)
+    cx = (min_x + max_x) * 0.5
+    cy = (min_y + max_y) * 0.5
+    span_x = max(1e-6, max_x - min_x)
+    span_y = max(1e-6, max_y - min_y)
+
+    if aspect >= 1.0:
+        required_ortho = max(span_x, span_y * aspect)
+    else:
+        required_ortho = max(span_x / aspect, span_y)
+    S = max(0.01, required_ortho * fit * 1.04)
+    cam_data.ortho_scale = S
+
+    # Use shift_x/shift_y to center the view — more reliable than moving the camera
+    # Blender shift is in proportion of ortho_scale (1.0 = one full canvas width)
+    cam_data.shift_x = cx / S
+    cam_data.shift_y = cy / S
+
+    depth = abs(min_z) + abs(max_z) + 1.0
+    cam_data.clip_start = max(0.001, depth / 100000.0)
+    cam_data.clip_end = max(1000.0, depth * 20.0)
+    bpy.context.view_layer.update()
+
+"""
+
+# Common render / color-management settings applied to `scene`.
+# Depends on file_format, width, height, look, exposure being in scope.
+_SCENE_RENDER_SETUP_SCRIPT = """\
+scene.render.engine = "BLENDER_EEVEE"
+scene.render.image_settings.file_format = file_format
+scene.render.use_file_extension = False
+scene.render.use_overwrite = True
+scene.render.resolution_x = width
+scene.render.resolution_y = height
+scene.render.resolution_percentage = 100
+scene.render.pixel_aspect_x = 1.0
+scene.render.pixel_aspect_y = 1.0
+scene.render.use_border = False
+scene.render.use_crop_to_border = False
+scene.render.filepath = out_path
+scene.render.film_transparent = False
+scene.view_settings.view_transform = "Filmic"
+scene.view_settings.look = look
+scene.view_settings.exposure = exposure
+
+"""
+
+# World/background node setup.
+# Depends on bg_r, bg_g, bg_b, bg_strength being in scope.
+_WORLD_SETUP_SCRIPT = """\
+if scene.world is None:
+    scene.world = bpy.data.worlds.new("PreviewWorld")
+scene.world.use_nodes = True
+bg = scene.world.node_tree.nodes.get("Background")
+if bg is not None:
+    bg.inputs["Color"].default_value = (bg_r, bg_g, bg_b, 1.0)
+    bg.inputs["Strength"].default_value = bg_strength
+
+"""
+
+# Camera creation + framing.
+# Depends on scene, center, radius, margin being in scope;
+# uses `world_pts` as the vertex list (both STL and BLEND scripts use this name).
+_CAMERA_SETUP_SCRIPT = """\
+cam_data = bpy.data.cameras.new("PreviewCamera")
+cam_obj = bpy.data.objects.new("PreviewCamera", cam_data)
+scene.collection.objects.link(cam_obj)
+scene.camera = cam_obj
+direction = mathutils.Vector((1.0, -1.0, 0.75)).normalized()
+cam_obj.location = center + direction * max(1.0, radius * 4.0)
+cam_obj.rotation_euler = (center - cam_obj.location).to_track_quat("-Z", "Y").to_euler()
+fit_camera_to_points(cam_obj, cam_data, world_pts, margin)
+
+"""
+
+_RENDER_CALL_SCRIPT = """\
+result_op = bpy.ops.render.render(write_still=True)
+if "FINISHED" not in result_op:
+    raise RuntimeError(f"Render-Operator abgebrochen: {result_op}")
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _get_blender_file_format(out_path: Path) -> str:
+    suffix = out_path.suffix.lower()
+    fmt = _BLENDER_FORMAT_MAP.get(suffix)
+    if fmt is None:
+        raise ValueError(f"Blender unterstützt dieses Dateiformat nicht: {suffix}")
+    return fmt
+
+
+def _run_blender_script(cmd: list, script_path: Path, out_path: Path) -> None:
+    """Run a Blender subprocess, clean up the temp script, and finalize output."""
+    started_at = time.time()
+    detail = ""
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        std_tail = (completed.stdout or "").strip().splitlines()[-4:]
+        err_tail = (completed.stderr or "").strip().splitlines()[-4:]
+        detail = " || ".join(std_tail + err_tail)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() if exc.stderr else str(exc)
+        raise RuntimeError(f"Blender-Rendering fehlgeschlagen: {detail}") from exc
+    finally:
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _finalize_blender_output(out_path, started_at, detail)
 
 
 def get_blender_preset_values(preset: str) -> dict[str, float]:
@@ -196,192 +360,107 @@ def render_stl_blender(
     framing_margin: float,
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = out_path.suffix.lower()
-    blender_format_map = {
-        ".png": "PNG",
-        ".jpg": "JPEG",
-        ".jpeg": "JPEG",
-        ".webp": "WEBP",
-    }
-    file_format = blender_format_map.get(suffix)
-    if file_format is None:
-        raise ValueError(f"Blender unterstützt dieses Dateiformat nicht: {suffix}")
+    file_format = _get_blender_file_format(out_path)
     preset = get_blender_preset_values(blender_preset)
     margin = max(0.0, min(1.0, float(framing_margin)))
 
-    script_content = textwrap.dedent(
-        """
-        import addon_utils
-        import bpy
-        import mathutils
-        from pathlib import Path
-        import sys
-        from math import radians
+    script_content = (
+        """\
+import addon_utils
+import bpy
+import mathutils
+from pathlib import Path
+import sys
+from math import radians
 
-        argv = sys.argv
-        if "--" not in argv:
-            raise SystemExit("missing args")
-        args = argv[argv.index("--") + 1:]
-        (
-            stl_path,
-            out_path,
-            width,
-            height,
-            file_format,
-            bg_r,
-            bg_g,
-            bg_b,
-            bg_strength,
-            mat_r,
-            mat_g,
-            mat_b,
-            roughness,
-            key_energy,
-            fill_energy,
-            exposure,
-            look,
-            margin,
-        ) = args[0], args[1], int(args[2]), int(args[3]), args[4], float(args[5]), float(args[6]), float(args[7]), float(args[8]), float(args[9]), float(args[10]), float(args[11]), float(args[12]), float(args[13]), float(args[14]), float(args[15]), args[16], float(args[17])
-        out_path = str(Path(out_path))
+argv = sys.argv
+if "--" not in argv:
+    raise SystemExit("missing args")
+args = argv[argv.index("--") + 1:]
+(
+    stl_path,
+    out_path,
+    width,
+    height,
+    file_format,
+    bg_r,
+    bg_g,
+    bg_b,
+    bg_strength,
+    mat_r,
+    mat_g,
+    mat_b,
+    roughness,
+    key_energy,
+    fill_energy,
+    exposure,
+    look,
+    margin,
+) = args[0], args[1], int(args[2]), int(args[3]), args[4], float(args[5]), float(args[6]), float(args[7]), float(args[8]), float(args[9]), float(args[10]), float(args[11]), float(args[12]), float(args[13]), float(args[14]), float(args[15]), args[16], float(args[17])
+out_path = str(Path(out_path))
 
-        def fit_camera_to_points(cam_obj, cam_data, points, margin):
-            if not points:
-                return
-            fit = 1.0 + margin
-            cam_data.type = "ORTHO"
-            cam_data.shift_x = 0.0
-            cam_data.shift_y = 0.0
-            aspect = max(1e-6, float(width) / max(1.0, float(height)))
-            # Build camera matrix directly from location/rotation (no view_layer.update needed)
-            rot_mat = cam_obj.rotation_euler.to_matrix().to_4x4()
-            cam_quat = cam_obj.rotation_euler.to_quaternion()
-            inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
-            cam_pts = [inv @ p for p in points]
+"""
+        + _FIT_CAMERA_SCRIPT
+        + """\
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+"""
+        + _SCENE_RENDER_SETUP_SCRIPT
+        + _WORLD_SETUP_SCRIPT
+        + """\
+addon_utils.enable("io_mesh_stl", default_set=False, persistent=False)
+imported = None
+if hasattr(bpy.ops.wm, "stl_import"):
+    imported = bpy.ops.wm.stl_import(filepath=stl_path)
+elif hasattr(bpy.ops.import_mesh, "stl"):
+    imported = bpy.ops.import_mesh.stl(filepath=stl_path)
+if imported is None or "FINISHED" not in imported:
+    raise RuntimeError("STL-Import in Blender fehlgeschlagen.")
 
-            # Push camera back if objects are too close or behind the camera
-            max_z = max(p.z for p in cam_pts)
-            if max_z > -0.05:
-                shift_z = max_z + 0.5
-                cam_obj.location += cam_quat @ mathutils.Vector((0.0, 0.0, shift_z))
-                inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
-                cam_pts = [inv @ p for p in points]
+if not bpy.context.selected_objects:
+    raise RuntimeError("Nach STL-Import wurde kein Objekt selektiert.")
+obj = bpy.context.selected_objects[0]
+bpy.context.view_layer.objects.active = obj
 
-            min_x = min(p.x for p in cam_pts)
-            max_x = max(p.x for p in cam_pts)
-            min_y = min(p.y for p in cam_pts)
-            max_y = max(p.y for p in cam_pts)
-            min_z = min(p.z for p in cam_pts)
-            max_z = max(p.z for p in cam_pts)
-            cx = (min_x + max_x) * 0.5
-            cy = (min_y + max_y) * 0.5
-            span_x = max(1e-6, max_x - min_x)
-            span_y = max(1e-6, max_y - min_y)
+mat = bpy.data.materials.new(name="PreviewMaterial")
+mat.use_nodes = True
+bsdf = mat.node_tree.nodes.get("Principled BSDF")
+bsdf.inputs["Base Color"].default_value = (mat_r, mat_g, mat_b, 1.0)
+bsdf.inputs["Roughness"].default_value = roughness
+if "Specular IOR Level" in bsdf.inputs:
+    bsdf.inputs["Specular IOR Level"].default_value = 0.35
+elif "Specular" in bsdf.inputs:
+    bsdf.inputs["Specular"].default_value = 0.35
+obj.data.materials.append(mat)
 
-            if aspect >= 1.0:
-                required_ortho = max(span_x, span_y * aspect)
-            else:
-                required_ortho = max(span_x / aspect, span_y)
-            S = max(0.01, required_ortho * fit * 1.04)
-            cam_data.ortho_scale = S
+world_pts = [obj.matrix_world @ v.co for v in obj.data.vertices]
+if not world_pts:
+    raise RuntimeError("Keine Geometriepunkte gefunden.")
+min_x = min(v.x for v in world_pts); max_x = max(v.x for v in world_pts)
+min_y = min(v.y for v in world_pts); max_y = max(v.y for v in world_pts)
+min_z = min(v.z for v in world_pts); max_z = max(v.z for v in world_pts)
+center = mathutils.Vector(((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5))
+radius = max(max_x - min_x, max_y - min_y, max_z - min_z) * 0.5 + 1e-6
 
-            # Use shift_x/shift_y to center the view — more reliable than moving the camera
-            # Blender shift is in proportion of ortho_scale (1.0 = one full canvas width)
-            cam_data.shift_x = cx / S
-            cam_data.shift_y = cy / S
+"""
+        + _CAMERA_SETUP_SCRIPT
+        + """\
+key_light = bpy.data.lights.new(name="Key", type='SUN')
+key_light.energy = key_energy
+key_obj = bpy.data.objects.new(name="Key", object_data=key_light)
+scene.collection.objects.link(key_obj)
+key_obj.rotation_euler = (radians(50), radians(10), radians(40))
 
-            depth = abs(min_z) + abs(max_z) + 1.0
-            cam_data.clip_start = max(0.001, depth / 100000.0)
-            cam_data.clip_end = max(1000.0, depth * 20.0)
-            bpy.context.view_layer.update()
+fill_light = bpy.data.lights.new(name="Fill", type='SUN')
+fill_light.energy = fill_energy
+fill_obj = bpy.data.objects.new(name="Fill", object_data=fill_light)
+scene.collection.objects.link(fill_obj)
+fill_obj.rotation_euler = (radians(45), radians(-20), radians(-120))
 
-        bpy.ops.wm.read_factory_settings(use_empty=True)
-        scene = bpy.context.scene
-        scene.render.engine = "BLENDER_EEVEE"
-        scene.render.image_settings.file_format = file_format
-        scene.render.use_file_extension = False
-        scene.render.use_overwrite = True
-        scene.render.resolution_x = width
-        scene.render.resolution_y = height
-        scene.render.resolution_percentage = 100
-        scene.render.pixel_aspect_x = 1.0
-        scene.render.pixel_aspect_y = 1.0
-        scene.render.use_border = False
-        scene.render.use_crop_to_border = False
-        scene.render.filepath = out_path
-        scene.render.film_transparent = False
-        scene.view_settings.view_transform = "Filmic"
-        scene.view_settings.look = look
-        scene.view_settings.exposure = exposure
-
-        if scene.world is None:
-            scene.world = bpy.data.worlds.new("PreviewWorld")
-        scene.world.use_nodes = True
-        bg = scene.world.node_tree.nodes.get("Background")
-        if bg is not None:
-            bg.inputs["Color"].default_value = (bg_r, bg_g, bg_b, 1.0)
-            bg.inputs["Strength"].default_value = bg_strength
-
-        addon_utils.enable("io_mesh_stl", default_set=False, persistent=False)
-        imported = None
-        if hasattr(bpy.ops.wm, "stl_import"):
-            imported = bpy.ops.wm.stl_import(filepath=stl_path)
-        elif hasattr(bpy.ops.import_mesh, "stl"):
-            imported = bpy.ops.import_mesh.stl(filepath=stl_path)
-        if imported is None or "FINISHED" not in imported:
-            raise RuntimeError("STL-Import in Blender fehlgeschlagen.")
-
-        if not bpy.context.selected_objects:
-            raise RuntimeError("Nach STL-Import wurde kein Objekt selektiert.")
-        obj = bpy.context.selected_objects[0]
-        bpy.context.view_layer.objects.active = obj
-
-        mat = bpy.data.materials.new(name="PreviewMaterial")
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get("Principled BSDF")
-        bsdf.inputs["Base Color"].default_value = (mat_r, mat_g, mat_b, 1.0)
-        bsdf.inputs["Roughness"].default_value = roughness
-        if "Specular IOR Level" in bsdf.inputs:
-            bsdf.inputs["Specular IOR Level"].default_value = 0.35
-        elif "Specular" in bsdf.inputs:
-            bsdf.inputs["Specular"].default_value = 0.35
-        obj.data.materials.append(mat)
-
-        world_pts = [obj.matrix_world @ v.co for v in obj.data.vertices]
-        if not world_pts:
-            raise RuntimeError("Keine Geometriepunkte gefunden.")
-        min_x = min(v.x for v in world_pts); max_x = max(v.x for v in world_pts)
-        min_y = min(v.y for v in world_pts); max_y = max(v.y for v in world_pts)
-        min_z = min(v.z for v in world_pts); max_z = max(v.z for v in world_pts)
-        center = mathutils.Vector(((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5))
-        radius = max(max_x - min_x, max_y - min_y, max_z - min_z) * 0.5 + 1e-6
-
-        cam_data = bpy.data.cameras.new("PreviewCamera")
-        cam_obj = bpy.data.objects.new("PreviewCamera", cam_data)
-        scene.collection.objects.link(cam_obj)
-        scene.camera = cam_obj
-        direction = mathutils.Vector((1.0, -1.0, 0.75)).normalized()
-        cam_obj.location = center + direction * max(1.0, radius * 4.0)
-        cam_obj.rotation_euler = (center - cam_obj.location).to_track_quat("-Z", "Y").to_euler()
-
-        fit_camera_to_points(cam_obj, cam_data, world_pts, margin)
-
-        key_light = bpy.data.lights.new(name="Key", type='SUN')
-        key_light.energy = key_energy
-        key_obj = bpy.data.objects.new(name="Key", object_data=key_light)
-        scene.collection.objects.link(key_obj)
-        key_obj.rotation_euler = (radians(50), radians(10), radians(40))
-
-        fill_light = bpy.data.lights.new(name="Fill", type='SUN')
-        fill_light.energy = fill_energy
-        fill_obj = bpy.data.objects.new(name="Fill", object_data=fill_light)
-        scene.collection.objects.link(fill_obj)
-        fill_obj.rotation_euler = (radians(45), radians(-20), radians(-120))
-
-        result_op = bpy.ops.render.render(write_still=True)
-        if "FINISHED" not in result_op:
-            raise RuntimeError(f"Render-Operator abgebrochen: {result_op}")
-        """
+"""
+        + _RENDER_CALL_SCRIPT
     )
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", encoding="utf-8", delete=False
     ) as script_file:
@@ -414,29 +493,7 @@ def render_stl_blender(
         str(preset["look"]),
         str(margin),
     ]
-    started_at = time.time()
-    detail = ""
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        std_tail = (completed.stdout or "").strip().splitlines()[-4:]
-        err_tail = (completed.stderr or "").strip().splitlines()[-4:]
-        detail = " || ".join(std_tail + err_tail)
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() if exc.stderr else str(exc)
-        raise RuntimeError(f"Blender-Rendering fehlgeschlagen: {detail}") from exc
-    finally:
-        try:
-            script_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    _finalize_blender_output(out_path, started_at, detail)
+    _run_blender_script(cmd, script_path, out_path)
 
 
 def render_blend_blender(
@@ -449,185 +506,104 @@ def render_blend_blender(
     framing_margin: float,
 ):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = out_path.suffix.lower()
-    blender_format_map = {
-        ".png": "PNG",
-        ".jpg": "JPEG",
-        ".jpeg": "JPEG",
-        ".webp": "WEBP",
-    }
-    file_format = blender_format_map.get(suffix)
-    if file_format is None:
-        raise ValueError(f"Blender unterstützt dieses Dateiformat nicht: {suffix}")
+    file_format = _get_blender_file_format(out_path)
     preset = get_blender_preset_values(blender_preset)
     margin = max(0.0, min(1.0, float(framing_margin)))
 
-    script_content = textwrap.dedent(
-        """
-        import bpy
-        import mathutils
-        from pathlib import Path
-        import sys
-        from math import radians
+    script_content = (
+        """\
+import bpy
+import mathutils
+from pathlib import Path
+import sys
+from math import radians
 
-        argv = sys.argv
-        if "--" not in argv:
-            raise SystemExit("missing args")
-        args = argv[argv.index("--") + 1:]
-        (
-            out_path,
-            width,
-            height,
-            file_format,
-            bg_r,
-            bg_g,
-            bg_b,
-            bg_strength,
-            key_energy,
-            fill_energy,
-            exposure,
-            look,
-            margin,
-        ) = args[0], int(args[1]), int(args[2]), args[3], float(args[4]), float(args[5]), float(args[6]), float(args[7]), float(args[8]), float(args[9]), float(args[10]), args[11], float(args[12])
-        out_path = str(Path(out_path))
+argv = sys.argv
+if "--" not in argv:
+    raise SystemExit("missing args")
+args = argv[argv.index("--") + 1:]
+(
+    out_path,
+    width,
+    height,
+    file_format,
+    bg_r,
+    bg_g,
+    bg_b,
+    bg_strength,
+    key_energy,
+    fill_energy,
+    exposure,
+    look,
+    margin,
+) = args[0], int(args[1]), int(args[2]), args[3], float(args[4]), float(args[5]), float(args[6]), float(args[7]), float(args[8]), float(args[9]), float(args[10]), args[11], float(args[12])
+out_path = str(Path(out_path))
 
-        def fit_camera_to_points(cam_obj, cam_data, points, margin):
-            if not points:
-                return
-            fit = 1.0 + margin
-            cam_data.type = "ORTHO"
-            cam_data.shift_x = 0.0
-            cam_data.shift_y = 0.0
-            aspect = max(1e-6, float(width) / max(1.0, float(height)))
-            # Build camera matrix directly from location/rotation (no view_layer.update needed)
-            rot_mat = cam_obj.rotation_euler.to_matrix().to_4x4()
-            cam_quat = cam_obj.rotation_euler.to_quaternion()
-            inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
-            cam_pts = [inv @ p for p in points]
+"""
+        + _FIT_CAMERA_SCRIPT
+        + """\
+scene = bpy.context.scene
+"""
+        + _SCENE_RENDER_SETUP_SCRIPT
+        + """\
+scene.render.use_compositing = False
+scene.render.use_sequencer = False
+scene.frame_set(1)
 
-            # Push camera back if objects are too close or behind the camera
-            max_z = max(p.z for p in cam_pts)
-            if max_z > -0.05:
-                shift_z = max_z + 0.5
-                cam_obj.location += cam_quat @ mathutils.Vector((0.0, 0.0, shift_z))
-                inv = (mathutils.Matrix.Translation(cam_obj.location) @ rot_mat).inverted()
-                cam_pts = [inv @ p for p in points]
+"""
+        + _WORLD_SETUP_SCRIPT
+        + """\
+objs = [o for o in scene.objects if o.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}]
+if not objs:
+    raise RuntimeError("BLEND enthält keine renderbaren Objekte.")
 
-            min_x = min(p.x for p in cam_pts)
-            max_x = max(p.x for p in cam_pts)
-            min_y = min(p.y for p in cam_pts)
-            max_y = max(p.y for p in cam_pts)
-            min_z = min(p.z for p in cam_pts)
-            max_z = max(p.z for p in cam_pts)
-            cx = (min_x + max_x) * 0.5
-            cy = (min_y + max_y) * 0.5
-            span_x = max(1e-6, max_x - min_x)
-            span_y = max(1e-6, max_y - min_y)
+world_pts = []
+for obj in objs:
+    for corner in obj.bound_box:
+        world_pts.append(obj.matrix_world @ mathutils.Vector(corner))
+min_x = min(v.x for v in world_pts); max_x = max(v.x for v in world_pts)
+min_y = min(v.y for v in world_pts); max_y = max(v.y for v in world_pts)
+min_z = min(v.z for v in world_pts); max_z = max(v.z for v in world_pts)
+center = mathutils.Vector(((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5))
+radius = max(max_x - min_x, max_y - min_y, max_z - min_z) * 0.5 + 1e-6
+# Always use dedicated preview camera for consistent framing.
+"""
+        + _CAMERA_SETUP_SCRIPT
+        + """\
+if not [o for o in scene.objects if o.type == "LIGHT"]:
+    key_light = bpy.data.lights.new(name="Key", type='SUN')
+    key_light.energy = key_energy
+    key_obj = bpy.data.objects.new(name="Key", object_data=key_light)
+    scene.collection.objects.link(key_obj)
+    key_obj.rotation_euler = (radians(50), radians(10), radians(40))
+    fill_light = bpy.data.lights.new(name="Fill", type='SUN')
+    fill_light.energy = fill_energy
+    fill_obj = bpy.data.objects.new(name="Fill", object_data=fill_light)
+    scene.collection.objects.link(fill_obj)
+    fill_obj.rotation_euler = (radians(45), radians(-20), radians(-120))
 
-            if aspect >= 1.0:
-                required_ortho = max(span_x, span_y * aspect)
-            else:
-                required_ortho = max(span_x / aspect, span_y)
-            S = max(0.01, required_ortho * fit * 1.04)
-            cam_data.ortho_scale = S
+# Apply a consistent preview material override to mesh objects
+# so BLEND thumbnails match STL thumbnail style.
+mesh_objs = [o for o in scene.objects if o.type == "MESH"]
+if mesh_objs:
+    mat = bpy.data.materials.new(name="PreviewMaterialBlend")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (0.12, 0.29, 0.75, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.42
+        if "Specular IOR Level" in bsdf.inputs:
+            bsdf.inputs["Specular IOR Level"].default_value = 0.35
+        elif "Specular" in bsdf.inputs:
+            bsdf.inputs["Specular"].default_value = 0.35
+    for obj in mesh_objs:
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
 
-            # Use shift_x/shift_y to center the view — more reliable than moving the camera
-            # Blender shift is in proportion of ortho_scale (1.0 = one full canvas width)
-            cam_data.shift_x = cx / S
-            cam_data.shift_y = cy / S
-
-            depth = abs(min_z) + abs(max_z) + 1.0
-            cam_data.clip_start = max(0.001, depth / 100000.0)
-            cam_data.clip_end = max(1000.0, depth * 20.0)
-            bpy.context.view_layer.update()
-
-        scene = bpy.context.scene
-        scene.render.engine = "BLENDER_EEVEE"
-        scene.render.image_settings.file_format = file_format
-        scene.render.use_file_extension = False
-        scene.render.use_overwrite = True
-        scene.render.resolution_x = width
-        scene.render.resolution_y = height
-        scene.render.resolution_percentage = 100
-        scene.render.pixel_aspect_x = 1.0
-        scene.render.pixel_aspect_y = 1.0
-        scene.render.use_border = False
-        scene.render.use_crop_to_border = False
-        scene.render.filepath = out_path
-        scene.render.film_transparent = False
-        scene.render.use_compositing = False
-        scene.render.use_sequencer = False
-        scene.view_settings.view_transform = "Filmic"
-        scene.view_settings.look = look
-        scene.view_settings.exposure = exposure
-        scene.frame_set(1)
-
-        if scene.world is None:
-            scene.world = bpy.data.worlds.new("PreviewWorld")
-        scene.world.use_nodes = True
-        bg = scene.world.node_tree.nodes.get("Background")
-        if bg is not None:
-            bg.inputs["Color"].default_value = (bg_r, bg_g, bg_b, 1.0)
-            bg.inputs["Strength"].default_value = bg_strength
-
-        objs = [o for o in scene.objects if o.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}]
-        if not objs:
-            raise RuntimeError("BLEND enthält keine renderbaren Objekte.")
-
-        points = []
-        for obj in objs:
-            for corner in obj.bound_box:
-                points.append(obj.matrix_world @ mathutils.Vector(corner))
-        min_x = min(v.x for v in points); max_x = max(v.x for v in points)
-        min_y = min(v.y for v in points); max_y = max(v.y for v in points)
-        min_z = min(v.z for v in points); max_z = max(v.z for v in points)
-        center = mathutils.Vector(((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5))
-        radius = max(max_x - min_x, max_y - min_y, max_z - min_z) * 0.5 + 1e-6
-        # Always use dedicated preview camera for consistent framing.
-        cam_data = bpy.data.cameras.new("PreviewCamera")
-        cam_obj = bpy.data.objects.new("PreviewCamera", cam_data)
-        scene.collection.objects.link(cam_obj)
-        scene.camera = cam_obj
-        direction = mathutils.Vector((1.0, -1.0, 0.75)).normalized()
-        cam_obj.location = center + direction * max(1.0, radius * 4.0)
-        cam_obj.rotation_euler = (center - cam_obj.location).to_track_quat("-Z", "Y").to_euler()
-        fit_camera_to_points(cam_obj, cam_data, points, margin)
-
-        if not [o for o in scene.objects if o.type == "LIGHT"]:
-            key_light = bpy.data.lights.new(name="Key", type='SUN')
-            key_light.energy = key_energy
-            key_obj = bpy.data.objects.new(name="Key", object_data=key_light)
-            scene.collection.objects.link(key_obj)
-            key_obj.rotation_euler = (radians(50), radians(10), radians(40))
-            fill_light = bpy.data.lights.new(name="Fill", type='SUN')
-            fill_light.energy = fill_energy
-            fill_obj = bpy.data.objects.new(name="Fill", object_data=fill_light)
-            scene.collection.objects.link(fill_obj)
-            fill_obj.rotation_euler = (radians(45), radians(-20), radians(-120))
-
-        # Apply a consistent preview material override to mesh objects
-        # so BLEND thumbnails match STL thumbnail style.
-        mesh_objs = [o for o in scene.objects if o.type == "MESH"]
-        if mesh_objs:
-            mat = bpy.data.materials.new(name="PreviewMaterialBlend")
-            mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get("Principled BSDF")
-            if bsdf is not None:
-                bsdf.inputs["Base Color"].default_value = (0.12, 0.29, 0.75, 1.0)
-                bsdf.inputs["Roughness"].default_value = 0.42
-                if "Specular IOR Level" in bsdf.inputs:
-                    bsdf.inputs["Specular IOR Level"].default_value = 0.35
-                elif "Specular" in bsdf.inputs:
-                    bsdf.inputs["Specular"].default_value = 0.35
-            for obj in mesh_objs:
-                obj.data.materials.clear()
-                obj.data.materials.append(mat)
-
-        result_op = bpy.ops.render.render(write_still=True)
-        if "FINISHED" not in result_op:
-            raise RuntimeError(f"Render-Operator abgebrochen: {result_op}")
-        """
+"""
+        + _RENDER_CALL_SCRIPT
     )
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", encoding="utf-8", delete=False
     ) as script_file:
@@ -655,29 +631,7 @@ def render_blend_blender(
         str(preset["look"]),
         str(margin),
     ]
-    started_at = time.time()
-    detail = ""
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        std_tail = (completed.stdout or "").strip().splitlines()[-4:]
-        err_tail = (completed.stderr or "").strip().splitlines()[-4:]
-        detail = " || ".join(std_tail + err_tail)
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() if exc.stderr else str(exc)
-        raise RuntimeError(f"Blender-Rendering fehlgeschlagen: {detail}") from exc
-    finally:
-        try:
-            script_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    _finalize_blender_output(out_path, started_at, detail)
+    _run_blender_script(cmd, script_path, out_path)
 
 
 def render_stl_pyvista(

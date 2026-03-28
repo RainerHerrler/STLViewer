@@ -83,6 +83,8 @@ def launch_gui() -> int:
             )
             self.tree_paths: dict[str, Path] = {}
             self.thumbnail_cache: list[tk.PhotoImage] = []
+            self.thumbnail_images: dict[Path, tk.PhotoImage] = {}
+            self.thumb_items: dict[Path, dict[str, object]] = {}
             self.directory_snapshot: list[Path] = []
             self.path_to_tree_id: dict[Path, str] = {}
             self.summary = ScanSummary()
@@ -94,6 +96,9 @@ def launch_gui() -> int:
             self.current_render_dir: Path | None = None
             self.render_inflight_paths: set[Path] = set()
             self.thumb_job_token = 0
+            self.thumb_relayout_after_id: str | None = None
+            self.current_thumb_files: list[Path] = []
+            self.thumb_columns = 0
             self.ui_queue: queue.Queue[tuple] = queue.Queue()
             self.selected_directory = self.source
             self._initial_sash_set = False
@@ -134,6 +139,7 @@ def launch_gui() -> int:
             self.style.configure("StatName.TLabel", font=("Segoe UI", 9), background="#ffffff", foreground="#576574")
             self.style.configure("StatValue.TLabel", font=("Segoe UI", 14, "bold"), background="#ffffff", foreground="#1f2d3d")
             self.style.configure("Toolbar.TButton", padding=(10, 4))
+            self.style.configure("Search.TEntry", padding=(6, 4))
 
         def _build_menu(self):
             menubar = tk.Menu(self.root)
@@ -184,7 +190,7 @@ def launch_gui() -> int:
             ).pack(side="left", padx=(6, 0))
             ttk.Button(
                 toolbar,
-                text="▸ Rendern (Alle)",
+                text="▶ Rendern (Alle)",
                 style="Toolbar.TButton",
                 command=lambda: self.start_background_render("all", overwrite=False),
             ).pack(side="left", padx=(6, 0))
@@ -198,7 +204,7 @@ def launch_gui() -> int:
             search_group = ttk.Frame(toolbar, style="Top.TFrame")
             search_group.pack(side="right", padx=(20, 0))
             ttk.Label(search_group, text="Suche:", style="Status.TLabel").pack(side="left", padx=(0, 6))
-            search_entry = ttk.Entry(search_group, textvariable=self.search_var, width=30)
+            search_entry = ttk.Entry(search_group, textvariable=self.search_var, width=30, style="Search.TEntry")
             search_entry.pack(side="left")
             search_entry.bind("<KeyRelease>", lambda _e: self._apply_search())
             ttk.Button(
@@ -289,7 +295,7 @@ def launch_gui() -> int:
             self.file_table.heading("name", text="Name")
             self.file_table.heading("size", text="Größe")
             self.file_table.heading("date", text="Datum")
-            self.file_table.column("status", width=72, anchor="center")
+            self.file_table.column("status", width=54, minwidth=54, stretch=False, anchor="center")
             self.file_table.column("name", width=280, anchor="w")
             self.file_table.column("size", width=110, anchor="e")
             self.file_table.column("date", width=170, anchor="w")
@@ -303,11 +309,35 @@ def launch_gui() -> int:
             self.file_table.pack(side="left", fill="both", expand=True)
             table_scroll.pack(side="right", fill="y")
 
-            ttk.Label(thumb_frame, text="Vorschau (Index)", style="SectionTitle.TLabel").pack(
-                anchor="w", pady=(0, 6)
+            preview_header = ttk.Frame(thumb_frame, style="Panel.TFrame")
+            preview_header.pack(fill="x", pady=(0, 6))
+            preview_title_wrap = ttk.Frame(preview_header, style="Panel.TFrame")
+            preview_title_wrap.pack(side="left", fill="x", expand=True)
+            ttk.Label(preview_title_wrap, text="Vorschau", style="SectionTitle.TLabel").pack(
+                side="left", anchor="w"
             )
+            self.preview_dir_label = ttk.Label(
+                preview_title_wrap,
+                text="",
+                style="SectionTitle.TLabel",
+            )
+            self.preview_dir_label.pack(side="left", padx=(8, 0))
+            ttk.Button(
+                preview_header,
+                text="▶",
+                width=3,
+                style="Toolbar.TButton",
+                command=self.page_thumbnails_next,
+            ).pack(side="right", padx=(6, 0))
+            ttk.Button(
+                preview_header,
+                text="◀",
+                width=3,
+                style="Toolbar.TButton",
+                command=self.page_thumbnails_prev,
+            ).pack(side="right")
 
-            self.thumb_canvas = tk.Canvas(thumb_frame, highlightthickness=0)
+            self.thumb_canvas = tk.Canvas(thumb_frame, highlightthickness=0, bg="#e6ebf2")
             self.thumb_scroll = ttk.Scrollbar(
                 thumb_frame, orient="vertical", command=self.thumb_canvas.yview
             )
@@ -448,6 +478,28 @@ def launch_gui() -> int:
 
         def _on_canvas_resize(self, event):
             self.thumb_canvas.itemconfigure(self.thumb_window, width=event.width)
+            if not self.current_thumb_files:
+                return
+            new_cols = self._compute_thumb_columns()
+            if new_cols == self.thumb_columns:
+                return
+            if self.thumb_relayout_after_id is not None:
+                self.root.after_cancel(self.thumb_relayout_after_id)
+            self.thumb_relayout_after_id = self.root.after(120, self._relayout_thumbnails)
+
+        def _relayout_thumbnails(self):
+            self.thumb_relayout_after_id = None
+            if not self.current_thumb_files:
+                return
+            self._populate_thumbnails(self.current_thumb_files, update_progress=False)
+
+        def _compute_thumb_columns(self) -> int:
+            thumb_w = 320
+            tile_w = thumb_w + 20
+            available = max(1, self.thumb_canvas.winfo_width() - 10)
+            cols = available // tile_w
+            cols = max(2, cols)
+            return min(8, cols)
 
         def _set_path_text(self):
             self.path_label.config(
@@ -463,6 +515,63 @@ def launch_gui() -> int:
             self.stat_total.config(text=str(self.summary.total_models))
             self.stat_existing.config(text=str(self.summary.images_available))
             self.stat_todo.config(text=str(self.summary.images_to_generate))
+
+        def _visible_directories_for_nav(self) -> list[Path]:
+            query_active = bool(self.search_var.get().strip())
+            dirs = []
+            for d in self.directory_snapshot:
+                if query_active and d not in self.search_match_dirs:
+                    continue
+                dirs.append(d)
+            if self.source not in dirs:
+                dirs.insert(0, self.source)
+            return dirs
+
+        def _select_directory(self, directory: Path):
+            self.selected_directory = directory
+            tree_id = self.path_to_tree_id.get(directory)
+            if tree_id:
+                self.dir_tree.selection_set(tree_id)
+                self.dir_tree.see(tree_id)
+            self._show_directory(directory)
+
+        def _next_directory_for_paging(self, current: Path) -> Path | None:
+            dirs = self._visible_directories_for_nav()
+            dir_set = set(dirs)
+
+            # 1) Prefer first child directory.
+            children = sorted([d for d in dirs if d.parent == current], key=lambda p: p.name.lower())
+            if children:
+                return children[0]
+
+            # 2) Otherwise search for next sibling; if none, climb to parent and retry.
+            node = current
+            while node != self.source:
+                parent = node.parent
+                if parent not in dir_set:
+                    break
+                siblings = sorted([d for d in dirs if d.parent == parent], key=lambda p: p.name.lower())
+                for idx, d in enumerate(siblings):
+                    if d == node and idx + 1 < len(siblings):
+                        return siblings[idx + 1]
+                node = parent
+            return None
+
+        def page_thumbnails_prev(self):
+            top, bottom = self.thumb_canvas.yview()
+            page = max(0.08, bottom - top)
+            self.thumb_canvas.yview_moveto(max(0.0, top - page))
+
+        def page_thumbnails_next(self):
+            top, bottom = self.thumb_canvas.yview()
+            page = max(0.08, bottom - top)
+            if bottom < 0.999:
+                self.thumb_canvas.yview_moveto(min(1.0, top + page))
+                return
+            next_dir = self._next_directory_for_paging(self.selected_directory)
+            if next_dir is not None:
+                self._select_directory(next_dir)
+                self._append_log(f"Paging: nächstes Verzeichnis -> {next_dir}")
 
         def _set_status(self, text: str):
             self.status_label.config(text=text)
@@ -655,6 +764,7 @@ def launch_gui() -> int:
                     event[6],
                 )
                 self.render_inflight_paths.discard(Path(model_path_str).resolve())
+                model_path = Path(model_path_str).resolve()
                 self.render_progress.processed += 1
                 if ok:
                     self.render_progress.succeeded += 1
@@ -670,6 +780,7 @@ def launch_gui() -> int:
                     f"OK: {self.render_progress.succeeded} Fehler: {self.render_progress.failed} | {filename}"
                 )
                 self._refresh_table_statuses()
+                self._update_thumbnail_for_model(model_path, in_progress=False)
                 if ok:
                     self._append_log(f"OK: {filename} -> {out_path}")
                 else:
@@ -715,8 +826,10 @@ def launch_gui() -> int:
                 self._clear_activity()
                 self._append_log(f"Rendering-Fehler: {event[1]}")
             elif kind == "render_task_start":
-                self.render_inflight_paths.add(Path(event[1]).resolve())
+                model_path = Path(event[1]).resolve()
+                self.render_inflight_paths.add(model_path)
                 self._refresh_table_statuses()
+                self._update_thumbnail_for_model(model_path, in_progress=True)
             elif kind == "thumb_progress":
                 if self.render_running:
                     return
@@ -776,6 +889,15 @@ def launch_gui() -> int:
                 self._show_directory(path)
 
         def _show_directory(self, directory: Path):
+            self.thumb_canvas.yview_moveto(0.0)
+            if directory == self.source:
+                rel_dir = self.source.name if self.source.name else str(self.source)
+            else:
+                try:
+                    rel_dir = str(directory.relative_to(self.source))
+                except ValueError:
+                    rel_dir = str(directory)
+            self.preview_dir_label.config(text=rel_dir)
             model_files = list_display_files(directory)
             query = self.search_var.get().strip()
             if query:
@@ -800,12 +922,12 @@ def launch_gui() -> int:
         def _status_for_model(self, model: Path) -> tuple[str, str]:
             out_path = target_image_path(model, self.source, self.index_dir, self.image_ext)
             if self.render_running and model.resolve() in self.render_inflight_paths:
-                return "computing", "●"
+                return "computing", "⬤"
             if not out_path.exists():
-                return "missing", "●"
+                return "missing", "⬤"
             if needs_render(model, out_path, overwrite=False):
-                return "stale", "●"
-            return "ready", "●"
+                return "stale", "⬤"
+            return "ready", "⬤"
 
         def _refresh_table_statuses(self):
             for item_id, model in list(self.file_item_paths.items()):
@@ -927,10 +1049,14 @@ def launch_gui() -> int:
             self.search_var.set("")
             self._apply_search()
 
-        def _populate_thumbnails(self, stl_files: list[Path]):
+        def _populate_thumbnails(self, stl_files: list[Path], update_progress: bool = True):
             self.thumb_job_token += 1
             token = self.thumb_job_token
+            self.current_thumb_files = list(stl_files)
             self.thumbnail_cache.clear()
+            self.thumbnail_images.clear()
+            self.thumb_items.clear()
+            self.thumb_canvas.yview_moveto(0.0)
             for widget in self.thumb_inner.winfo_children():
                 widget.destroy()
 
@@ -944,10 +1070,13 @@ def launch_gui() -> int:
                 return
 
             thumb_w, thumb_h = 320, 220
-            columns = 2
-            self.thumb_inner.columnconfigure(0, weight=1)
-            self.thumb_inner.columnconfigure(1, weight=1)
-            if not self.render_running:
+            columns = self._compute_thumb_columns()
+            self.thumb_columns = columns
+            for c in range(12):
+                self.thumb_inner.columnconfigure(c, weight=0)
+            for c in range(columns):
+                self.thumb_inner.columnconfigure(c, weight=1)
+            if update_progress and not self.render_running:
                 self._set_progress(0, len(stl_files))
                 self._set_activity(f"Vorschau wird aufgebaut: 0/{len(stl_files)}")
 
@@ -957,39 +1086,28 @@ def launch_gui() -> int:
                 end_index = min(start_index + 8, len(stl_files))
                 for idx in range(start_index, end_index):
                     stl = stl_files[idx]
+                    model_path = stl.resolve()
                     out_path = target_image_path(stl, self.source, self.index_dir, self.image_ext)
                     row = idx // columns
                     col = idx % columns
-                    tile = ttk.Frame(self.thumb_inner, padding=8, relief="ridge")
-                    tile.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+                    tile = ttk.Frame(self.thumb_inner, padding=(4, 4), relief="ridge")
+                    tile.grid(row=row, column=col, sticky="n", padx=4, pady=(2, 4))
                     image_holder = ttk.Frame(tile, width=thumb_w, height=thumb_h)
-                    image_holder.pack(fill="x")
+                    image_holder.pack(anchor="n")
                     image_holder.pack_propagate(False)
-
-                    if out_path.exists():
-                        try:
-                            image = tk.PhotoImage(file=str(out_path))
-                            factor = max(
-                                1,
-                                math.ceil(image.width() / thumb_w),
-                                math.ceil(image.height() / thumb_h),
-                            )
-                            thumb = image.subsample(factor, factor)
-                            self.thumbnail_cache.append(thumb)
-                            ttk.Label(image_holder, image=thumb, anchor="center").place(
-                                relx=0.5, rely=0.5, anchor="center"
-                            )
-                        except tk.TclError:
-                            ttk.Label(image_holder, text="Vorschau kann nicht geladen werden.").place(
-                                relx=0.5, rely=0.5, anchor="center"
-                            )
+                    self.thumb_items[model_path] = {
+                        "holder": image_holder,
+                        "out_path": out_path,
+                        "thumb_w": thumb_w,
+                        "thumb_h": thumb_h,
+                    }
+                    if self.render_running and model_path in self.render_inflight_paths:
+                        self._update_thumbnail_for_model(model_path, in_progress=True)
                     else:
-                        ttk.Label(image_holder, text="Kein Bild im Index vorhanden.").place(
-                            relx=0.5, rely=0.5, anchor="center"
-                        )
+                        self._update_thumbnail_for_model(model_path, in_progress=False)
 
                     ttk.Label(tile, text=stl.name, wraplength=thumb_w, anchor="center").pack(
-                        fill="x", pady=(8, 0)
+                        fill="x", pady=(3, 0)
                     )
 
                 self.ui_queue.put(("thumb_progress", end_index, len(stl_files)))
@@ -999,6 +1117,42 @@ def launch_gui() -> int:
                     self.ui_queue.put(("thumb_done",))
 
             self.root.after(1, lambda: build_chunk(0))
+
+        def _update_thumbnail_for_model(self, model_path: Path, in_progress: bool):
+            item = self.thumb_items.get(model_path)
+            if not item:
+                return
+            holder = item["holder"]
+            out_path = item["out_path"]
+            thumb_w = int(item["thumb_w"])
+            thumb_h = int(item["thumb_h"])
+
+            for child in holder.winfo_children():
+                child.destroy()
+
+            if in_progress:
+                ttk.Label(holder, text="Bild wird erzeugt ...").place(relx=0.5, rely=0.5, anchor="center")
+                return
+
+            if out_path.exists():
+                try:
+                    image = tk.PhotoImage(file=str(out_path))
+                    factor = max(
+                        1,
+                        math.ceil(image.width() / thumb_w),
+                        math.ceil(image.height() / thumb_h),
+                    )
+                    thumb = image.subsample(factor, factor)
+                    self.thumbnail_images[model_path] = thumb
+                    self.thumbnail_cache.append(thumb)
+                    ttk.Label(holder, image=thumb, anchor="center").place(relx=0.5, rely=0.5, anchor="center")
+                    return
+                except tk.TclError:
+                    ttk.Label(holder, text="Vorschau kann nicht geladen werden.").place(
+                        relx=0.5, rely=0.5, anchor="center"
+                    )
+                    return
+            ttk.Label(holder, text="Kein Bild im Index vorhanden.").place(relx=0.5, rely=0.5, anchor="center")
 
         def start_background_render(self, scope: str, overwrite: bool):
             if self.render_running:
