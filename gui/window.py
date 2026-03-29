@@ -4,11 +4,13 @@ import concurrent.futures
 import difflib
 import json
 import math
+import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -356,6 +358,7 @@ def launch_gui() -> int:
             self.file_context_menu.add_command(label=self._t("context.open_explorer"), command=self._open_selected_in_explorer)
             self.file_context_menu.add_command(label=self._t("context.open_blender"), command=self._open_selected_in_blender)
             self.file_context_menu.add_command(label=self._t("context.open_bambu"), command=self._open_selected_in_bambu_studio)
+            self.file_context_menu.add_command(label=self._t("context.view3d"), command=self._open_selected_in_3d_view)
             self.file_table.bind("<Button-3>", self._on_file_table_context_menu)
 
             preview_header = ttk.Frame(thumb_frame, style="Panel.TFrame")
@@ -606,6 +609,7 @@ def launch_gui() -> int:
             self.file_context_menu.entryconfig(0, label=self._t("context.open_explorer"))
             self.file_context_menu.entryconfig(1, label=self._t("context.open_blender"))
             self.file_context_menu.entryconfig(2, label=self._t("context.open_bambu"))
+            self.file_context_menu.entryconfig(3, label=self._t("context.view3d"))
             self._set_path_text()
             self._update_table_heading_indicators()
             if self.nav_toggle_tooltip_label is not None:
@@ -1438,6 +1442,135 @@ def launch_gui() -> int:
                 messagebox.showerror(self._t("dialog.error"), self._t("open.bambu.start_error", error=exc))
                 self._append_log(self._t("open.bambu.start_error_log", error=exc))
 
+        def _model_path_for_3d_view(self, model: Path) -> Path | None:
+            suffix = model.suffix.lower()
+            if suffix == ".stl":
+                return model
+            if suffix == ".blend":
+                stl = model.with_suffix(".stl")
+                if stl.exists() and stl.is_file():
+                    return stl
+                stl_upper = model.with_suffix(".STL")
+                if stl_upper.exists() and stl_upper.is_file():
+                    return stl_upper
+            return None
+
+        def _can_open_3d_view(self, model: Path) -> bool:
+            return model.suffix.lower() in (".stl", ".blend")
+
+        def _export_blend_to_temp_stl(self, blend_path: Path) -> Path | None:
+            blender_exe = detect_blender_executable(self.blender_path)
+            if blender_exe is None:
+                messagebox.showerror(self._t("dialog.error"), self._t("view3d.blender_missing"))
+                self._append_log(self._t("view3d.blender_missing_log"))
+                return None
+
+            fd, tmp_name = tempfile.mkstemp(prefix="stlpreview_view3d_", suffix=".stl")
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            out_path = Path(tmp_name)
+
+            export_script = (
+                "import bpy,sys\n"
+                "out=sys.argv[sys.argv.index('--')+1]\n"
+                "ok=False\n"
+                "try:\n"
+                "    bpy.ops.export_mesh.stl(filepath=out, use_selection=False, ascii=False)\n"
+                "    ok=True\n"
+                "except Exception:\n"
+                "    ok=False\n"
+                "if not ok:\n"
+                "    try:\n"
+                "        bpy.ops.wm.stl_export(filepath=out, export_selected_objects=False)\n"
+                "        ok=True\n"
+                "    except Exception:\n"
+                "        ok=False\n"
+                "if not ok:\n"
+                "    raise RuntimeError('STL export operator unavailable')\n"
+            )
+            self._append_log(self._t("view3d.convert_start_log", path=blend_path.name))
+            try:
+                proc = subprocess.run(
+                    [str(blender_exe), "-b", str(blend_path), "--python-expr", export_script, "--", str(out_path)],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                )
+            except Exception as exc:
+                messagebox.showerror(self._t("dialog.error"), self._t("view3d.convert_failed", error=exc))
+                self._append_log(self._t("view3d.convert_failed_log", error=exc))
+                return None
+
+            if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size <= 0:
+                stderr = (proc.stderr or "").strip()
+                stdout = (proc.stdout or "").strip()
+                details = stderr if stderr else stdout
+                if len(details) > 280:
+                    details = details[:280] + "..."
+                err_msg = details if details else f"return code {proc.returncode}"
+                messagebox.showerror(self._t("dialog.error"), self._t("view3d.convert_failed", error=err_msg))
+                self._append_log(self._t("view3d.convert_failed_log", error=err_msg))
+                return None
+
+            self._append_log(self._t("view3d.convert_ok_log", path=out_path))
+            return out_path
+
+        def _open_selected_in_3d_view(self):
+            if self.context_model_path is None:
+                return
+            source_model = self.context_model_path
+            suffix = source_model.suffix.lower()
+            if suffix not in (".stl", ".blend"):
+                messagebox.showinfo(
+                    self._t("dialog.info"),
+                    self._t("view3d.no_stl_source", path=source_model.name),
+                )
+                self._append_log(self._t("view3d.no_stl_source_log", path=source_model))
+                return
+            view_model = self._model_path_for_3d_view(source_model)
+            if view_model is None and suffix == ".blend":
+                view_model = self._export_blend_to_temp_stl(source_model)
+            if view_model is None:
+                messagebox.showinfo(
+                    self._t("dialog.info"),
+                    self._t("view3d.no_stl_source", path=source_model.name),
+                )
+                self._append_log(self._t("view3d.no_stl_source_log", path=source_model))
+                return
+            try:
+                import pyvista  # noqa: F401
+            except Exception:
+                messagebox.showerror(self._t("dialog.error"), self._t("view3d.pyvista_missing"))
+                self._append_log(self._t("view3d.pyvista_missing_log"))
+                return
+
+            viewer_script = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "import pyvista as pv\n"
+                "path = Path(sys.argv[1])\n"
+                "mesh = pv.read(str(path))\n"
+                "plotter = pv.Plotter(window_size=(1200, 800))\n"
+                "plotter.set_background('#f2f4f7')\n"
+                "plotter.add_axes()\n"
+                "plotter.show_grid(color='lightgray')\n"
+                "plotter.add_mesh(mesh, color='#2f5fb3', smooth_shading=True)\n"
+                "plotter.add_title(path.name, font_size=12)\n"
+                "plotter.show()\n"
+            )
+            try:
+                subprocess.Popen([sys.executable, "-c", viewer_script, str(view_model)])
+                self._append_log(self._t("view3d.opened_log", source=source_model.name, target=view_model))
+            except Exception as exc:
+                messagebox.showerror(self._t("dialog.error"), self._t("view3d.start_error", error=exc))
+                self._append_log(self._t("view3d.start_error_log", error=exc))
+
         def _on_file_table_context_menu(self, event):
             row_id = self.file_table.identify_row(event.y)
             if not row_id:
@@ -1447,10 +1580,12 @@ def launch_gui() -> int:
             if model is None:
                 return
             self.context_model_path = model
+            has_3d_view = self._can_open_3d_view(model)
             self.file_context_menu.entryconfig(
-                self._t("context.open_bambu"),
+                2,
                 state=("normal" if model.suffix.lower() == ".stl" else "disabled"),
             )
+            self.file_context_menu.entryconfig(3, state=("normal" if has_3d_view else "disabled"))
             try:
                 self.file_context_menu.tk_popup(event.x_root, event.y_root)
             finally:
